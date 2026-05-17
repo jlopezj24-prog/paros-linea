@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import create_engine, event, text, MetaData
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
@@ -31,7 +31,12 @@ else:
     engine.dispose()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
+# En Postgres, atar TODAS las tablas al esquema "paros" para no chocar
+# con tablas que tengan el mismo nombre en "public" (otro proyecto)
+if IS_POSTGRES:
+    Base = declarative_base(metadata=MetaData(schema=DB_SCHEMA))
+else:
+    Base = declarative_base()
 
 
 def get_db():
