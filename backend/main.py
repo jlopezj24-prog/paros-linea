@@ -1,0 +1,561 @@
+"""API Paros de Línea — registro hora por hora, reporte gerencial y KPIs.
+
+Reglas de negocio:
+- Meta JPH = 62 (configurable por registro).
+- Turnos: día (06:00-18:00) y noche (18:00-06:00). Lun-Sáb.
+- 12 horas productivas - 45 min descanso (30 comedor + 15 snack) = 11h 15min reales.
+- Categorías de paro: Operaciones (rojo), Mantenimiento (azul), Materiales (naranja), Programados (gris).
+- Reporte gerencial: solo paros > 2 minutos no excluidos.
+"""
+from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from pydantic import BaseModel, Field
+from typing import Optional, List
+from datetime import date as date_type, datetime
+import io
+
+from database import engine, get_db, Base, SessionLocal
+import models
+import seed
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Paros de Línea digital", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Contraseña simple para vista gerencial (cambiar via env GERENTE_PASS)
+import os
+GERENTE_PASS = os.environ.get("GERENTE_PASS", "gerente123")
+
+HORAS_TURNO = {
+    # (hora, label, minutos_productivos, tipo, meta_override_opcional)
+    # tipo: "prod" = bloque productivo capturable; "break" = descanso, no capturable
+    # Si meta_override está presente, sustituye al cálculo meta_jph * (minutos/60)
+    "dia": [
+        (1, "06:00-07:00", 60, "prod"),
+        (2, "07:00-08:00", 60, "prod"),
+        (3, "08:00-09:00", 60, "prod"),
+        (4, "09:00-10:00", 60, "prod"),
+        (5, "10:00-11:00", 60, "prod"),
+        (0, "11:00-11:30  COMEDOR", 0, "break"),
+        (6, "11:30-12:30", 60, "prod"),
+        (7, "12:30-13:30", 60, "prod"),
+        (8, "13:30-14:30", 60, "prod"),
+        (9, "14:30-15:45  (incl. snack 15:00-15:15)", 60, "prod"),
+        (10, "15:45-16:45", 60, "prod"),
+        (11, "16:45-18:00", 75, "prod", 75),
+    ],
+    "noche": [
+        (1, "18:00-19:00", 60, "prod"),
+        (2, "19:00-20:00", 60, "prod"),
+        (3, "20:00-21:00", 60, "prod"),
+        (4, "21:00-22:00", 60, "prod"),
+        (5, "22:00-23:00", 60, "prod"),
+        (0, "23:00-23:30  COMEDOR", 0, "break"),
+        (6, "23:30-00:30", 60, "prod"),
+        (7, "00:30-01:30", 60, "prod"),
+        (8, "01:30-02:30", 60, "prod"),
+        (9, "02:30-03:45  (incl. snack 03:00-03:15)", 60, "prod"),
+        (10, "03:45-04:45", 60, "prod"),
+        (11, "04:45-06:00", 75, "prod", 75),
+    ],
+}
+
+
+def _override_para(turno: str, hora: int):
+    for item in HORAS_TURNO.get(turno, []):
+        if item[0] == hora and item[3] == "prod":
+            return item[4] if len(item) > 4 else None
+    return None
+
+
+@app.on_event("startup")
+def _on_startup():
+    seed.run()
+
+
+# -------- Schemas --------
+class LineaOut(BaseModel):
+    id: int
+    nombre: str
+    area: str
+    orden: int
+
+    class Config:
+        from_attributes = True
+
+
+class CategoriaOut(BaseModel):
+    id: int
+    nombre: str
+    color: str
+    hex: str
+
+    class Config:
+        from_attributes = True
+
+
+class ParoIn(BaseModel):
+    categoria_id: int
+    duracion_min: float = Field(gt=0)
+    descripcion: str = ""
+
+
+class ParoOut(BaseModel):
+    id: int
+    categoria_id: int
+    categoria_nombre: str
+    color: str
+    hex: str
+    duracion_min: float
+    descripcion: str
+    excluido_gerencial: bool
+
+    class Config:
+        from_attributes = True
+
+
+class RegistroIn(BaseModel):
+    fecha: date_type
+    turno: str
+    linea_id: int
+    hora: int
+    meta_jph: int = 62
+    produccion: int = 0
+    observaciones: str = ""
+    paros: List[ParoIn] = []
+
+
+class RegistroOut(BaseModel):
+    id: int
+    fecha: date_type
+    turno: str
+    linea_id: int
+    linea_nombre: str
+    area: str
+    hora: int
+    hora_label: str
+    meta_jph: int
+    meta: float  # meta efectiva del bloque (jobs)
+    produccion: int
+    minutos_disponibles: int
+    observaciones: str
+    paros: List[ParoOut]
+    eficiencia: float  # produccion / meta_proporcional
+
+
+def _meta_proporcional(meta_jph: int, minutos: int, override=None) -> float:
+    if override is not None:
+        return float(override)
+    return round(meta_jph * (minutos / 60.0), 2)
+
+
+def _meta_de(r) -> float:
+    return _meta_proporcional(r.meta_jph, r.minutos_disponibles,
+                              _override_para(r.turno, r.hora))
+
+
+def _registro_to_out(r: models.RegistroHora) -> RegistroOut:
+    meta_h = _meta_de(r)
+    eficiencia = (r.produccion / meta_h * 100) if meta_h > 0 else 0
+    return RegistroOut(
+        id=r.id, fecha=r.fecha, turno=r.turno, linea_id=r.linea_id,
+        linea_nombre=r.linea.nombre, area=r.linea.area, hora=r.hora,
+        hora_label=r.hora_label, meta_jph=r.meta_jph, meta=meta_h,
+        produccion=r.produccion,
+        minutos_disponibles=r.minutos_disponibles, observaciones=r.observaciones or "",
+        paros=[
+            ParoOut(
+                id=p.id, categoria_id=p.categoria_id,
+                categoria_nombre=p.categoria.nombre, color=p.categoria.color,
+                hex=p.categoria.hex, duracion_min=p.duracion_min,
+                descripcion=p.descripcion or "",
+                excluido_gerencial=p.excluido_gerencial,
+            ) for p in r.paros
+        ],
+        eficiencia=round(eficiencia, 1),
+    )
+
+
+# -------- Catálogos --------
+@app.get("/api/lineas", response_model=List[LineaOut])
+def get_lineas(db: Session = Depends(get_db)):
+    return db.query(models.Linea).filter_by(activa=True).order_by(models.Linea.orden).all()
+
+
+@app.get("/api/categorias", response_model=List[CategoriaOut])
+def get_categorias(db: Session = Depends(get_db)):
+    return db.query(models.CategoriaParo).order_by(models.CategoriaParo.id).all()
+
+
+@app.get("/api/horas/{turno}")
+def get_horas(turno: str):
+    if turno not in HORAS_TURNO:
+        raise HTTPException(400, "Turno inválido (dia|noche)")
+    out = []
+    for item in HORAS_TURNO[turno]:
+        h, l, m, t = item[0], item[1], item[2], item[3]
+        override = item[4] if len(item) > 4 else None
+        out.append({"hora": h, "label": l, "minutos": m, "tipo": t,
+                    "meta_override": override})
+    return out
+
+
+@app.get("/api/turno-info")
+def turno_info():
+    return {
+        "meta_jph_default": 62,
+        "horas_brutas": 12,
+        "min_descanso": 45,
+        "horas_productivas": 11.25,
+        "meta_turno": round(62 * 11.25, 0),
+        "turnos": list(HORAS_TURNO.keys()),
+    }
+
+
+# -------- Registros --------
+@app.post("/api/registros", response_model=RegistroOut)
+def upsert_registro(payload: RegistroIn, db: Session = Depends(get_db)):
+    if payload.turno not in HORAS_TURNO:
+        raise HTTPException(400, "Turno inválido")
+    horas_map = {
+        item[0]: (item[1], item[2])
+        for item in HORAS_TURNO[payload.turno] if item[3] == "prod"
+    }
+    if payload.hora not in horas_map:
+        raise HTTPException(400, "Hora inválida (no es bloque productivo)")
+    label, minutos = horas_map[payload.hora]
+
+    r = (
+        db.query(models.RegistroHora)
+        .filter_by(fecha=payload.fecha, turno=payload.turno,
+                   linea_id=payload.linea_id, hora=payload.hora)
+        .first()
+    )
+    if not r:
+        r = models.RegistroHora(
+            fecha=payload.fecha, turno=payload.turno,
+            linea_id=payload.linea_id, hora=payload.hora,
+            hora_label=label, minutos_disponibles=minutos,
+        )
+        db.add(r)
+    r.hora_label = label
+    r.minutos_disponibles = minutos
+    r.meta_jph = payload.meta_jph
+    r.produccion = payload.produccion
+    r.observaciones = payload.observaciones
+    # Reemplazar paros
+    for p in list(r.paros):
+        db.delete(p)
+    db.flush()
+    for p in payload.paros:
+        db.add(models.Paro(
+            registro=r, categoria_id=p.categoria_id,
+            duracion_min=p.duracion_min, descripcion=p.descripcion,
+        ))
+    db.commit()
+    db.refresh(r)
+    return _registro_to_out(r)
+
+
+@app.get("/api/registros", response_model=List[RegistroOut])
+def list_registros(
+    fecha: date_type = Query(...),
+    turno: str = Query(...),
+    linea_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    q = db.query(models.RegistroHora).filter_by(fecha=fecha, turno=turno)
+    if linea_id:
+        q = q.filter_by(linea_id=linea_id)
+    regs = q.order_by(models.RegistroHora.linea_id, models.RegistroHora.hora).all()
+    return [_registro_to_out(r) for r in regs]
+
+
+@app.delete("/api/registros/{registro_id}")
+def delete_registro(registro_id: int, db: Session = Depends(get_db)):
+    r = db.query(models.RegistroHora).get(registro_id)
+    if not r:
+        raise HTTPException(404)
+    db.delete(r)
+    db.commit()
+    return {"ok": True}
+
+
+# -------- Reporte gerencial --------
+def _check_gerente(password: str):
+    if password != GERENTE_PASS:
+        raise HTTPException(401, "Contraseña gerencial incorrecta")
+
+
+@app.get("/api/reporte-gerencial")
+def reporte_gerencial(
+    fecha: date_type = Query(...),
+    turno: str = Query(...),
+    password: str = Query(...),
+    umbral_min: float = 2.0,
+    db: Session = Depends(get_db),
+):
+    _check_gerente(password)
+    rows = (
+        db.query(models.Paro, models.RegistroHora, models.Linea, models.CategoriaParo)
+        .join(models.RegistroHora, models.Paro.registro_id == models.RegistroHora.id)
+        .join(models.Linea, models.RegistroHora.linea_id == models.Linea.id)
+        .join(models.CategoriaParo, models.Paro.categoria_id == models.CategoriaParo.id)
+        .filter(models.RegistroHora.fecha == fecha)
+        .filter(models.RegistroHora.turno == turno)
+        .filter(models.Paro.duracion_min > umbral_min)
+        .filter(models.Paro.excluido_gerencial == False)  # noqa: E712
+        .order_by(models.Linea.orden, models.RegistroHora.hora)
+        .all()
+    )
+    return [
+        {
+            "paro_id": p.id,
+            "linea": l.nombre,
+            "area": l.area,
+            "hora": r.hora_label,
+            "categoria": c.nombre,
+            "color": c.color,
+            "hex": c.hex,
+            "duracion_min": p.duracion_min,
+            "descripcion": p.descripcion or "",
+        }
+        for p, r, l, c in rows
+    ]
+
+
+@app.patch("/api/paros/{paro_id}/excluir")
+def excluir_paro(paro_id: int, password: str = Query(...), db: Session = Depends(get_db)):
+    _check_gerente(password)
+    p = db.query(models.Paro).get(paro_id)
+    if not p:
+        raise HTTPException(404)
+    p.excluido_gerencial = True
+    db.commit()
+    return {"ok": True}
+
+
+@app.patch("/api/paros/{paro_id}/restaurar")
+def restaurar_paro(paro_id: int, password: str = Query(...), db: Session = Depends(get_db)):
+    _check_gerente(password)
+    p = db.query(models.Paro).get(paro_id)
+    if not p:
+        raise HTTPException(404)
+    p.excluido_gerencial = False
+    db.commit()
+    return {"ok": True}
+
+
+# -------- KPIs / Dashboard --------
+@app.get("/api/kpis")
+def kpis(fecha: date_type = Query(...), turno: str = Query(...), db: Session = Depends(get_db)):
+    regs = db.query(models.RegistroHora).filter_by(fecha=fecha, turno=turno).all()
+    total_prod = sum(r.produccion for r in regs)
+    total_meta = sum(_meta_de(r) for r in regs)
+    # Bloques productivos esperados por turno
+    horas_esperadas = sum(
+        1 for item in HORAS_TURNO.get(turno, []) if item[3] == "prod"
+    )
+    # Por línea: incluir TODAS las líneas activas para detectar faltantes
+    lineas = db.query(models.Linea).filter_by(activa=True).order_by(models.Linea.orden).all()
+    por_linea = {
+        l.nombre: {
+            "linea": l.nombre, "area": l.area,
+            "produccion": 0, "meta": 0.0, "paros_min": 0.0,
+            "horas_capturadas": 0, "horas_esperadas": horas_esperadas,
+        }
+        for l in lineas
+    }
+    for r in regs:
+        d = por_linea.get(r.linea.nombre)
+        if not d:
+            continue
+        d["produccion"] += r.produccion
+        d["meta"] += _meta_de(r)
+        d["paros_min"] += sum(p.duracion_min for p in r.paros)
+        d["horas_capturadas"] += 1
+    for d in por_linea.values():
+        d["eficiencia"] = round(d["produccion"] / d["meta"] * 100, 1) if d["meta"] else 0
+        d["meta"] = round(d["meta"], 1)
+        d["pendientes"] = max(0, d["horas_esperadas"] - d["horas_capturadas"])
+        d["completo"] = d["horas_capturadas"] >= d["horas_esperadas"]
+    # Por categoría
+    por_cat = {}
+    for r in regs:
+        for p in r.paros:
+            k = p.categoria.nombre
+            d = por_cat.setdefault(k, {"categoria": k, "color": p.categoria.color,
+                                       "hex": p.categoria.hex, "minutos": 0, "eventos": 0})
+            d["minutos"] += p.duracion_min
+            d["eventos"] += 1
+    return {
+        "total_produccion": total_prod,
+        "total_meta": round(total_meta, 1),
+        "cumplimiento_pct": round(total_prod / total_meta * 100, 1) if total_meta else 0,
+        "por_linea": list(por_linea.values()),
+        "por_categoria": list(por_cat.values()),
+    }
+
+
+# -------- Export Excel --------
+@app.get("/api/export/excel")
+def export_excel(fecha: date_type = Query(...), turno: str = Query(...),
+                 db: Session = Depends(get_db)):
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment
+    regs = (
+        db.query(models.RegistroHora)
+        .filter_by(fecha=fecha, turno=turno)
+        .join(models.Linea).order_by(models.Linea.orden, models.RegistroHora.hora)
+        .all()
+    )
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"{fecha}_{turno}"
+    headers = ["Área", "Línea", "Hora", "Meta JPH", "Producción",
+               "Eficiencia %", "Paros (categoría: min)", "Observaciones"]
+    ws.append(headers)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+        c.alignment = Alignment(horizontal="center")
+    color_map = {"red": "FFDC2626", "blue": "FF2563EB",
+                 "orange": "FFEA580C", "gray": "FF6B7280"}
+    for r in regs:
+        meta_h = _meta_de(r)
+        ef = round(r.produccion / meta_h * 100, 1) if meta_h else 0
+        paros_txt = " | ".join(
+            f"{p.categoria.nombre}: {p.duracion_min}m" for p in r.paros
+        )
+        ws.append([r.linea.area, r.linea.nombre, r.hora_label, r.meta_jph,
+                   r.produccion, ef, paros_txt, r.observaciones or ""])
+        # color de fondo si hay paros (primer categoría)
+        if r.paros:
+            color = color_map.get(r.paros[0].categoria.color)
+            if color:
+                ws.cell(row=ws.max_row, column=7).fill = PatternFill(
+                    fill_type="solid", fgColor=color)
+                ws.cell(row=ws.max_row, column=7).font = Font(color="FFFFFFFF", bold=True)
+    for col in ws.columns:
+        max_len = max(len(str(c.value)) if c.value else 0 for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    fname = f"paros_{fecha}_{turno}.xlsx"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.get("/api/export/gerencial-excel")
+def export_gerencial_excel(
+    fecha: date_type = Query(...),
+    turno: str = Query(...),
+    password: str = Query(...),
+    umbral_min: float = 2.0,
+    db: Session = Depends(get_db),
+):
+    _check_gerente(password)
+    from openpyxl import Workbook
+    from openpyxl.styles import PatternFill, Font, Alignment
+    rows = (
+        db.query(models.Paro, models.RegistroHora, models.Linea, models.CategoriaParo)
+        .join(models.RegistroHora, models.Paro.registro_id == models.RegistroHora.id)
+        .join(models.Linea, models.RegistroHora.linea_id == models.Linea.id)
+        .join(models.CategoriaParo, models.Paro.categoria_id == models.CategoriaParo.id)
+        .filter(models.RegistroHora.fecha == fecha)
+        .filter(models.RegistroHora.turno == turno)
+        .filter(models.Paro.duracion_min > umbral_min)
+        .filter(models.Paro.excluido_gerencial == False)  # noqa: E712
+        .order_by(models.Linea.orden, models.RegistroHora.hora)
+        .all()
+    )
+    wb = Workbook()
+    ws = wb.active
+    ws.title = f"Gerencial_{turno}"
+    ws.append([f"Reporte Gerencial · {fecha} · Turno {turno}",
+               f"Paros > {umbral_min} min"])
+    ws.cell(row=1, column=1).font = Font(bold=True, size=14)
+    ws.append([])
+    headers = ["Área", "Línea", "Hora", "Categoría", "Min", "Descripción"]
+    ws.append(headers)
+    for c in ws[3]:
+        c.font = Font(bold=True, color="FFFFFFFF")
+        c.fill = PatternFill(fill_type="solid", fgColor="FF1E293B")
+        c.alignment = Alignment(horizontal="center")
+    color_map = {"red": "FFDC2626", "blue": "FF2563EB",
+                 "orange": "FFEA580C", "gray": "FF6B7280"}
+    total_min = 0
+    for p, r, l, c in rows:
+        ws.append([l.area, l.nombre, r.hora_label, c.nombre,
+                   p.duracion_min, p.descripcion or ""])
+        fill_color = color_map.get(c.color)
+        if fill_color:
+            cell = ws.cell(row=ws.max_row, column=4)
+            cell.fill = PatternFill(fill_type="solid", fgColor=fill_color)
+            cell.font = Font(color="FFFFFFFF", bold=True)
+            cell.alignment = Alignment(horizontal="center")
+        total_min += p.duracion_min
+    ws.append([])
+    ws.append(["", "", "", "TOTAL", round(total_min, 1), f"{len(rows)} paros"])
+    ws.cell(row=ws.max_row, column=4).font = Font(bold=True)
+    ws.cell(row=ws.max_row, column=5).font = Font(bold=True)
+    for col in ws.columns:
+        max_len = max(len(str(c.value)) if c.value else 0 for c in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    fname = f"reporte_gerencial_{fecha}_{turno}.xlsx"
+    return StreamingResponse(
+        bio,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@app.get("/api")
+def api_root():
+    return {"app": "Paros de Línea digital", "docs": "/docs"}
+
+
+# --- Servir frontend buildeado (modo producción) ---
+# Si existe ../frontend/dist, montar como SPA estática en la raíz.
+_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+if _DIST.exists():
+    # Assets (JS/CSS) servidos con caché por Vite
+    app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def spa_index():
+        return FileResponse(_DIST / "index.html")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def spa_fallback(full_path: str):
+        # Cualquier ruta no /api ni /docs ni /assets devuelve index.html (React Router)
+        if full_path.startswith(("api/", "docs", "openapi.json")):
+            raise HTTPException(status_code=404)
+        target = _DIST / full_path
+        if full_path and target.is_file():
+            return FileResponse(target)
+        return FileResponse(_DIST / "index.html")
+else:
+    @app.get("/")
+    def root():
+        return {"app": "Paros de Línea digital", "docs": "/docs", "warning": "frontend/dist no encontrado"}
