@@ -17,15 +17,18 @@ else:
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     IS_POSTGRES = True
 
-    # 1) Crear el esquema si no existe (una sola vez al iniciar)
-    with engine.begin() as conn:
-        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{DB_SCHEMA}"'))
-
-    # 2) Forzar que cada conexión use ese esquema por defecto
+    # 1) PRIMERO registrar el listener: cada conexión nueva fija el search_path
     @event.listens_for(engine, "connect")
     def _set_search_path(dbapi_connection, _):
         with dbapi_connection.cursor() as cur:
             cur.execute(f'SET search_path TO "{DB_SCHEMA}", public')
+
+    # 2) Crear el esquema si no existe (ya con el listener activo)
+    with engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{DB_SCHEMA}"'))
+
+    # 3) Invalidar cualquier conexión previa del pool por si acaso
+    engine.dispose()
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
