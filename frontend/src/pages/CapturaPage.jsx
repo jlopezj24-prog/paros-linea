@@ -95,20 +95,27 @@ export default function CapturaPage() {
   async function guardar() {
     if (!editando || !lineaSel) return
     setSavingMsg('Guardando…')
-    await api.post('/registros', {
-      fecha, turno, linea_id: lineaSel, hora: editando.hora,
-      meta_jph: Number(meta), produccion: Number(form.produccion),
-      observaciones: form.observaciones,
-      paros: form.paros.map(p => ({
-        categoria_id: Number(p.categoria_id),
-        duracion_min: Number(p.duracion_min),
-        descripcion: p.descripcion,
-      })),
-    })
-    setSavingMsg('Guardado ✓')
-    setTimeout(() => setSavingMsg(''), 1500)
-    setEditando(null)
-    cargarRegistros()
+    try {
+      await api.post('/registros', {
+        fecha, turno, linea_id: lineaSel, hora: editando.hora,
+        meta_jph: Number(meta), produccion: Number(form.produccion),
+        observaciones: form.observaciones,
+        paros: form.paros.map(p => ({
+          categoria_id: Number(p.categoria_id),
+          duracion_min: Number(p.duracion_min),
+          descripcion: p.descripcion,
+        })),
+      })
+      setSavingMsg('Guardado ✓')
+      setTimeout(() => setSavingMsg(''), 1500)
+      setEditando(null)
+      cargarRegistros()
+    } catch (e) {
+      const detalle = e?.response?.data?.detail || e?.message || 'Error desconocido'
+      const status = e?.response?.status ? ` (HTTP ${e.response.status})` : ''
+      setSavingMsg('')
+      alert(`No se pudo guardar${status}:\n${detalle}`)
+    }
   }
 
   function colorCategoria(id) {
