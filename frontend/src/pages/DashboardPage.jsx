@@ -2,11 +2,24 @@ import { useEffect, useState } from 'react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts'
 import api from '../api.js'
 
-function hoy() { return new Date().toISOString().slice(0, 10) }
+// Fecha local YYYY-MM-DD; para turno noche en madrugada, usa la fecha en que inició el turno (ayer)
+function fechaTurnoActual() {
+  const ahora = new Date()
+  const h = ahora.getHours()
+  const base = new Date(ahora)
+  let turno = 'dia'
+  if (h < 6) { base.setDate(base.getDate() - 1); turno = 'noche' }
+  else if (h >= 18) { turno = 'noche' }
+  const y = base.getFullYear()
+  const m = String(base.getMonth() + 1).padStart(2, '0')
+  const d = String(base.getDate()).padStart(2, '0')
+  return { fecha: `${y}-${m}-${d}`, turno }
+}
 
 export default function DashboardPage() {
-  const [fecha, setFecha] = useState(hoy())
-  const [turno, setTurno] = useState('dia')
+  const ini = fechaTurnoActual()
+  const [fecha, setFecha] = useState(ini.fecha)
+  const [turno, setTurno] = useState(ini.turno)
   const [data, setData] = useState(null)
 
   useEffect(() => {

@@ -1,14 +1,36 @@
 import { useEffect, useMemo, useState } from 'react'
 import api from '../api.js'
 
-function hoy() {
-  const d = new Date()
-  return d.toISOString().slice(0, 10)
+// Fecha local en formato YYYY-MM-DD (NO usar toISOString, que devuelve UTC)
+function fechaLocal(d = new Date()) {
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
+
+// "Fecha del turno": para turno noche, si ya pasó medianoche pero aún no son
+// las 6 AM, el turno empezó AYER, así que la fecha sigue siendo la del día anterior.
+function fechaTurnoActual() {
+  const ahora = new Date()
+  const h = ahora.getHours()
+  if (h < 6) {
+    // Madrugada: pertenece al turno noche que empezó ayer
+    const ayer = new Date(ahora)
+    ayer.setDate(ayer.getDate() - 1)
+    return { fecha: fechaLocal(ayer), turno: 'noche' }
+  }
+  if (h >= 18) {
+    // Tarde-noche: turno noche que empieza HOY
+    return { fecha: fechaLocal(ahora), turno: 'noche' }
+  }
+  return { fecha: fechaLocal(ahora), turno: 'dia' }
 }
 
 export default function CapturaPage() {
-  const [fecha, setFecha] = useState(hoy())
-  const [turno, setTurno] = useState('dia')
+  const inicial = fechaTurnoActual()
+  const [fecha, setFecha] = useState(inicial.fecha)
+  const [turno, setTurno] = useState(inicial.turno)
   const [lineas, setLineas] = useState([])
   const [categorias, setCategorias] = useState([])
   const [horas, setHoras] = useState([])
