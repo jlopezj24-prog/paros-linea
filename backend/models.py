@@ -29,7 +29,7 @@ class RegistroHora(Base):
     turno = Column(String(10), nullable=False, index=True)  # dia | noche
     linea_id = Column(Integer, ForeignKey("lineas.id"), nullable=False)
     hora = Column(Integer, nullable=False)  # 1..12 (hora del turno)
-    hora_label = Column(String(20), nullable=False)  # "06:00-07:00"
+    hora_label = Column(String(80), nullable=False)  # "06:00-07:00" o "02:30-03:45 (incl. snack ...)"
     meta_jph = Column(Integer, default=62)
     produccion = Column(Integer, default=0)
     minutos_disponibles = Column(Integer, default=60)  # 60 o 45/30 si hay break

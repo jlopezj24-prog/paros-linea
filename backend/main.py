@@ -19,11 +19,20 @@ from typing import Optional, List
 from datetime import date as date_type, datetime
 import io
 
-from database import engine, get_db, Base, SessionLocal
+from database import engine, get_db, Base, SessionLocal, IS_POSTGRES, DB_SCHEMA
 import models
 import seed
+from sqlalchemy import text
 
 Base.metadata.create_all(bind=engine)
+
+# Migración rápida: ampliar hora_label si quedó como VARCHAR(20) de un deploy viejo
+if IS_POSTGRES:
+    with engine.begin() as _c:
+        _c.execute(text(
+            f'ALTER TABLE "{DB_SCHEMA}".registros_hora '
+            'ALTER COLUMN hora_label TYPE VARCHAR(80)'
+        ))
 
 app = FastAPI(title="Paros de Línea digital", version="1.0.0")
 
