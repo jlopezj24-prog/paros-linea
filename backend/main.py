@@ -315,10 +315,11 @@ def reporte_gerencial(
     turno: str = Query(...),
     password: str = Query(...),
     umbral_min: float = 2.0,
+    linea_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     _check_gerente(password)
-    rows = (
+    q = (
         db.query(models.Paro, models.RegistroHora, models.Linea, models.CategoriaParo)
         .join(models.RegistroHora, models.Paro.registro_id == models.RegistroHora.id)
         .join(models.Linea, models.RegistroHora.linea_id == models.Linea.id)
@@ -327,9 +328,10 @@ def reporte_gerencial(
         .filter(models.RegistroHora.turno == turno)
         .filter(models.Paro.duracion_min > umbral_min)
         .filter(models.Paro.excluido_gerencial == False)  # noqa: E712
-        .order_by(models.Linea.orden, models.RegistroHora.hora)
-        .all()
     )
+    if linea_id:
+        q = q.filter(models.RegistroHora.linea_id == linea_id)
+    rows = q.order_by(models.Linea.orden, models.RegistroHora.hora).all()
     return [
         {
             "paro_id": p.id,
@@ -478,12 +480,13 @@ def export_gerencial_excel(
     turno: str = Query(...),
     password: str = Query(...),
     umbral_min: float = 2.0,
+    linea_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     _check_gerente(password)
     from openpyxl import Workbook
     from openpyxl.styles import PatternFill, Font, Alignment
-    rows = (
+    q = (
         db.query(models.Paro, models.RegistroHora, models.Linea, models.CategoriaParo)
         .join(models.RegistroHora, models.Paro.registro_id == models.RegistroHora.id)
         .join(models.Linea, models.RegistroHora.linea_id == models.Linea.id)
@@ -492,9 +495,10 @@ def export_gerencial_excel(
         .filter(models.RegistroHora.turno == turno)
         .filter(models.Paro.duracion_min > umbral_min)
         .filter(models.Paro.excluido_gerencial == False)  # noqa: E712
-        .order_by(models.Linea.orden, models.RegistroHora.hora)
-        .all()
     )
+    if linea_id:
+        q = q.filter(models.RegistroHora.linea_id == linea_id)
+    rows = q.order_by(models.Linea.orden, models.RegistroHora.hora).all()
     wb = Workbook()
     ws = wb.active
     ws.title = f"Gerencial_{turno}"

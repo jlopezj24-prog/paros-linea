@@ -22,15 +22,21 @@ export default function GerencialPage() {
   const [fecha, setFecha] = useState(ini.fecha)
   const [turno, setTurno] = useState(ini.turno)
   const [umbral, setUmbral] = useState(2)
+  const [lineaId, setLineaId] = useState('')
+  const [lineas, setLineas] = useState([])
   const [paros, setParos] = useState([])
   const [err, setErr] = useState('')
+
+  useEffect(() => {
+    api.get('/lineas').then(r => setLineas(r.data)).catch(() => {})
+  }, [])
 
   async function cargar(passOverride) {
     const p = passOverride ?? pass
     try {
-      const r = await api.get('/reporte-gerencial', {
-        params: { fecha, turno, password: p, umbral_min: umbral }
-      })
+      const params = { fecha, turno, password: p, umbral_min: umbral }
+      if (lineaId) params.linea_id = lineaId
+      const r = await api.get('/reporte-gerencial', { params })
       setParos(r.data); setAuth(true); setErr('')
     } catch (e) {
       setErr(e?.response?.status === 401 ? 'Contraseña incorrecta' : 'Error al consultar')
@@ -38,7 +44,7 @@ export default function GerencialPage() {
     }
   }
 
-  useEffect(() => { if (auth) cargar() }, [fecha, turno, umbral])
+  useEffect(() => { if (auth) cargar() }, [fecha, turno, umbral, lineaId])
 
   async function excluir(id) {
     if (!confirm('¿Excluir este paro de la bitácora?')) return
@@ -88,13 +94,28 @@ export default function GerencialPage() {
                  onChange={e => setUmbral(Number(e.target.value))}
                  className="border rounded px-2 py-1 w-24" />
         </div>
+        <div className="min-w-[200px]">
+          <label className="block text-xs text-slate-500">Línea</label>
+          <select value={lineaId} onChange={e => setLineaId(e.target.value)}
+                  className="border rounded px-2 py-1 w-full">
+            <option value="">— Todas —</option>
+            <optgroup label="Vestiduras">
+              {lineas.filter(l => l.area === 'Vestiduras').map(l =>
+                <option key={l.id} value={l.id}>{l.nombre}</option>)}
+            </optgroup>
+            <optgroup label="Chasis">
+              {lineas.filter(l => l.area === 'Chasis').map(l =>
+                <option key={l.id} value={l.id}>{l.nombre}</option>)}
+            </optgroup>
+          </select>
+        </div>
         <div className="flex-1 text-right text-sm flex items-center justify-end gap-3 flex-wrap">
           <div>
             <span className="text-slate-500">Total paros: </span><b>{paros.length}</b>{' · '}
             <span className="text-slate-500">Minutos: </span><b>{totalMin.toFixed(1)}</b>
           </div>
           <a className="bg-emerald-600 text-white text-sm px-3 py-2 rounded hover:bg-emerald-700"
-             href={`/api/export/gerencial-excel?fecha=${fecha}&turno=${turno}&umbral_min=${umbral}&password=${encodeURIComponent(pass)}`}
+             href={`/api/export/gerencial-excel?fecha=${fecha}&turno=${turno}&umbral_min=${umbral}${lineaId ? `&linea_id=${lineaId}` : ''}&password=${encodeURIComponent(pass)}`}
              target="_blank" rel="noreferrer">
             Exportar Excel
           </a>
