@@ -464,7 +464,7 @@ async def parse_dtr_pdf(
         if "highest alarm" in line.lower() or "report generated" in line.lower():
             continue
         duracion = _hms_a_min(m.group("total"))
-        if duracion <= 0:
+        if duracion <= 1.0:
             continue
         cat_nombre = _detectar_categoria(msg)
         cat = cat_por_nombre.get(cat_nombre) or cat_por_nombre.get("Mantenimiento")
