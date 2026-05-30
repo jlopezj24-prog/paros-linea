@@ -197,7 +197,7 @@ export default function CapturaPage() {
                 <tr className="text-left text-slate-600 border-b">
                   <th className="py-2 px-2">Hora</th>
                   <th className="px-2">Min</th>
-                  <th className="px-2">Meta</th>
+                  <th className="px-2">Meta JPH (jobs)</th>
                   <th className="px-2">Prod.</th>
                   <th className="px-2">Ef.%</th>
                   <th className="px-2">Paros</th>
@@ -219,12 +219,13 @@ export default function CapturaPage() {
                   const metaH = h.meta_override != null
                     ? h.meta_override
                     : (r?.meta_jph || 62) * (h.minutos / 60)
+                  const jphH = Math.round(metaH * 60 / h.minutos)
                   const ef = r ? (r.produccion / metaH * 100) : null
                   return (
                     <tr key={h.hora} className="border-b hover:bg-slate-50">
                       <td className="py-2 px-2 font-medium">{h.label}</td>
                       <td className="px-2">{h.minutos}</td>
-                      <td className="px-2">{Math.round(metaH)}</td>
+                      <td className="px-2">{jphH} <span className="text-xs text-slate-400">({Math.round(metaH)})</span></td>
                       <td className="px-2">{r?.produccion ?? '—'}</td>
                       <td className="px-2">
                         {ef !== null ? (
