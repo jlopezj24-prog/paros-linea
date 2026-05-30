@@ -7,7 +7,7 @@ Reglas de negocio:
 - Categorías de paro: Operaciones (rojo), Mantenimiento (azul), Materiales (naranja), Programados (gris).
 - Reporte gerencial: solo paros > 2 minutos no excluidos.
 """
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +23,7 @@ from database import engine, get_db, Base, SessionLocal, IS_POSTGRES, DB_SCHEMA
 import models
 import seed
 from sqlalchemy import text
+import re
 
 Base.metadata.create_all(bind=engine)
 
@@ -301,6 +302,197 @@ def delete_registro(registro_id: int, db: Session = Depends(get_db)):
     db.delete(r)
     db.commit()
     return {"ok": True}
+
+
+# -------- Importación DTR (PDF Top Alarms) --------
+def _hms_a_min(hms: str) -> float:
+    """'00:01:05' -> minutos float (1.0833...)."""
+    try:
+        h, m, s = hms.strip().split(":")
+        return round(int(h) * 60 + int(m) + int(s) / 60.0, 2)
+    except Exception:
+        return 0.0
+
+
+def _detectar_categoria(alarm: str) -> str:
+    """Devuelve nombre de categoría para una línea del DTR."""
+    t = alarm.upper()
+    # Llamada de operador / paros de operación en estación
+    if "TEAM MEMBER HELP" in t:
+        return "Operaciones"
+    if " TT STOPPED" in t or t.startswith("TT STOPPED") \
+       or " PP STOPPED" in t or t.startswith("PP STOPPED"):
+        return "Operaciones"
+    if "QF " in t or t.startswith("QF "):
+        return "Operaciones"
+    # Fallas mecánicas / proceso
+    if t.startswith("MF ") or " MF " in t[:6] \
+       or t.startswith("PF ") or t.startswith("TFIB ") \
+       or t.startswith("TF "):
+        return "Mantenimiento"
+    return "Mantenimiento"
+
+
+def _hora_bloque_desde_horas(turno: str, start_hhmm: str):
+    """Busca en HORAS_TURNO[turno] el bloque productivo cuyo label empiece con start_hhmm."""
+    for item in HORAS_TURNO.get(turno, []):
+        if item[3] != "prod":
+            continue
+        if item[1].startswith(start_hhmm + "-"):
+            return {"hora": item[0], "label": item[1], "minutos": item[2]}
+    return None
+
+
+def _sugerir_linea(texto: str, lineas) -> Optional[int]:
+    """Heurística: busca tokens VES1..VES4, TRIM1..TRIM4 etc para sugerir línea."""
+    t = texto.upper()
+    mapeo = {
+        "VES1": "Vestiduras 1", "VES2": "Vestiduras 2",
+        "VES3": "Vestiduras 3", "VES4": "Vestiduras 4",
+        "TRIM1": "Vestiduras 1", "TRIM2": "Vestiduras 2",
+        "TRIM3": "Vestiduras 3", "TRIM4": "Vestiduras 4",
+        "CHASIS1": "Chasis 1", "CHASIS2": "Chasis 2", "CHASIS3": "Chasis 3",
+        "FINAL": "Linea Final", "MOTORES": "Motores", "AGVS": "AGVS",
+        "PUERTAS": "Puertas", "TOLDOS": "Toldos",
+    }
+    for token, nombre_linea in mapeo.items():
+        if token in t:
+            for l in lineas:
+                if l.nombre.lower() == nombre_linea.lower():
+                    return l.id
+    return None
+
+
+@app.post("/api/dtr/parse")
+async def parse_dtr_pdf(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Parsea un PDF de Top Alarms (DTR) y devuelve los paros listos para precargar.
+
+    Respuesta:
+    {
+      meta: { fecha, start_time, end_time, sub_area, turno_sugerido,
+              hora_sugerida, hora_label, linea_sugerida_id },
+      paros: [ { categoria_id, categoria_nombre, descripcion, duracion_min,
+                 count, resource } ]
+    }
+    """
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Debe ser un archivo PDF")
+    try:
+        import pdfplumber
+    except ImportError:
+        raise HTTPException(500, "pdfplumber no instalado en el servidor")
+
+    contenido = await file.read()
+    texto_paginas = []
+    try:
+        with pdfplumber.open(io.BytesIO(contenido)) as pdf:
+            for page in pdf.pages:
+                texto_paginas.append(page.extract_text() or "")
+    except Exception as e:
+        raise HTTPException(400, f"PDF inválido: {e}")
+    texto = "\n".join(texto_paginas)
+    if not texto.strip():
+        raise HTTPException(400, "No se pudo extraer texto del PDF")
+
+    # --- Parseo de encabezado ---
+    fecha_match = re.search(r"From:\s*(\d{1,2}/\d{1,2}/\d{2,4})", texto)
+    start_match = re.search(r"Start Time:\s*(\d{1,2}:\d{2})", texto)
+    end_match = re.search(r"End Time:\s*(\d{1,2}:\d{2})", texto)
+    sub_area_match = re.search(r"Sub Area:\s*(\S+)", texto)
+
+    fecha_iso = None
+    if fecha_match:
+        try:
+            d = datetime.strptime(fecha_match.group(1), "%m/%d/%Y").date()
+            fecha_iso = d.isoformat()
+        except ValueError:
+            try:
+                d = datetime.strptime(fecha_match.group(1), "%m/%d/%y").date()
+                fecha_iso = d.isoformat()
+            except ValueError:
+                pass
+
+    start_hhmm = start_match.group(1) if start_match else None
+    end_hhmm = end_match.group(1) if end_match else None
+    sub_area = sub_area_match.group(1) if sub_area_match else ""
+
+    # Turno: si Start está entre 06:00-17:59 → día; si no → noche
+    turno_sug = None
+    hora_info = None
+    if start_hhmm:
+        try:
+            hh = int(start_hhmm.split(":")[0])
+            turno_sug = "dia" if 6 <= hh < 18 else "noche"
+            hora_info = _hora_bloque_desde_horas(turno_sug, start_hhmm)
+        except ValueError:
+            pass
+
+    # Línea sugerida
+    lineas = db.query(models.Linea).filter_by(activa=True).all()
+    linea_sug_id = _sugerir_linea(texto, lineas)
+
+    # Categorías por nombre → id
+    categorias = db.query(models.CategoriaParo).all()
+    cat_por_nombre = {c.nombre: c for c in categorias}
+
+    # --- Parseo de filas de alarmas ---
+    # Formato típico:
+    # "G1TRIM4C_VES4 MF GT_SKL04 IFD404 IDC2 EN FALLA @A15N REVISAR ARMORSTART 1 00:01:05 00:01:05"
+    # → resource | alarm_message | count | high_alarm | total_adjusted_duration
+    fila_re = re.compile(
+        r"^(?P<res>\S+)\s+"
+        r"(?P<msg>.+?)\s+"
+        r"(?P<count>\d+)\s+"
+        r"(?P<high>\d{1,2}:\d{2}:\d{2})\s+"
+        r"(?P<total>\d{1,2}:\d{2}:\d{2})\s*$"
+    )
+    paros_out = []
+    for raw_line in texto.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        m = fila_re.match(line)
+        if not m:
+            continue
+        # Filtrar líneas de totales o headers que pudieran matchear casualmente
+        msg = m.group("msg").strip()
+        if msg.lower().startswith("alarm message"):
+            continue
+        if "highest alarm" in line.lower() or "report generated" in line.lower():
+            continue
+        duracion = _hms_a_min(m.group("total"))
+        if duracion <= 0:
+            continue
+        cat_nombre = _detectar_categoria(msg)
+        cat = cat_por_nombre.get(cat_nombre) or cat_por_nombre.get("Mantenimiento")
+        if cat is None:
+            continue
+        paros_out.append({
+            "categoria_id": cat.id,
+            "categoria_nombre": cat.nombre,
+            "descripcion": msg[:300],
+            "duracion_min": duracion,
+            "count": int(m.group("count")),
+            "resource": m.group("res"),
+        })
+
+    return {
+        "meta": {
+            "fecha": fecha_iso,
+            "start_time": start_hhmm,
+            "end_time": end_hhmm,
+            "sub_area": sub_area,
+            "turno_sugerido": turno_sug,
+            "hora_sugerida": hora_info["hora"] if hora_info else None,
+            "hora_label": hora_info["label"] if hora_info else None,
+            "minutos_bloque": hora_info["minutos"] if hora_info else None,
+            "linea_sugerida_id": linea_sug_id,
+        },
+        "paros": paros_out,
+    }
 
 
 # -------- Reporte gerencial --------
