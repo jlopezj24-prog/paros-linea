@@ -17,57 +17,34 @@ function fechaTurnoActual() {
 
 export default function GerencialPage() {
   const ini = fechaTurnoActual()
-  const [pass, setPass] = useState('')
-  const [auth, setAuth] = useState(false)
   const [fecha, setFecha] = useState(ini.fecha)
   const [turno, setTurno] = useState(ini.turno)
   const [umbral, setUmbral] = useState(2)
   const [lineaId, setLineaId] = useState('')
   const [lineas, setLineas] = useState([])
   const [paros, setParos] = useState([])
-  const [err, setErr] = useState('')
 
   useEffect(() => {
     api.get('/lineas').then(r => setLineas(r.data)).catch(() => {})
   }, [])
 
-  async function cargar(passOverride) {
-    const p = passOverride ?? pass
+  async function cargar() {
     try {
-      const params = { fecha, turno, password: p, umbral_min: umbral }
+      const params = { fecha, turno, password: 'x', umbral_min: umbral }
       if (lineaId) params.linea_id = lineaId
       const r = await api.get('/reporte-gerencial', { params })
-      setParos(r.data); setAuth(true); setErr('')
+      setParos(r.data)
     } catch (e) {
-      setErr(e?.response?.status === 401 ? 'Contraseña incorrecta' : 'Error al consultar')
-      setAuth(false)
+      console.error('Error al consultar', e)
     }
   }
 
-  useEffect(() => { if (auth) cargar() }, [fecha, turno, umbral, lineaId])
+  useEffect(() => { cargar() }, [fecha, turno, umbral, lineaId])
 
   async function excluir(id) {
     if (!confirm('¿Excluir este paro de la bitácora?')) return
-    await api.patch(`/paros/${id}/excluir`, null, { params: { password: pass } })
+    await api.patch(`/paros/${id}/excluir`, null, { params: { password: 'x' } })
     cargar()
-  }
-
-  if (!auth) {
-    return (
-      <div className="max-w-sm mx-auto bg-white rounded-lg shadow p-6 mt-10">
-        <h2 className="font-semibold text-lg mb-2">Acceso gerencial</h2>
-        <p className="text-xs text-slate-500 mb-4">Solo paros mayores al umbral configurado.</p>
-        <input type="password" placeholder="Contraseña" value={pass}
-               onChange={e => setPass(e.target.value)}
-               className="border rounded px-3 py-2 w-full mb-2"
-               onKeyDown={e => e.key === 'Enter' && cargar()} />
-        {err && <p className="text-red-600 text-sm mb-2">{err}</p>}
-        <button onClick={() => cargar()}
-                className="bg-slate-900 text-white w-full py-2 rounded hover:bg-slate-700">
-          Ingresar
-        </button>
-      </div>
-    )
   }
 
   const totalMin = paros.reduce((s, p) => s + p.duracion_min, 0)
@@ -115,7 +92,7 @@ export default function GerencialPage() {
             <span className="text-slate-500">Minutos: </span><b>{totalMin.toFixed(1)}</b>
           </div>
           <a className="bg-emerald-600 text-white text-sm px-3 py-2 rounded hover:bg-emerald-700"
-             href={`/api/export/gerencial-excel?fecha=${fecha}&turno=${turno}&umbral_min=${umbral}${lineaId ? `&linea_id=${lineaId}` : ''}&password=${encodeURIComponent(pass)}`}
+             href={`/api/export/gerencial-excel?fecha=${fecha}&turno=${turno}&umbral_min=${umbral}${lineaId ? `&linea_id=${lineaId}` : ''}&password=x`}
              target="_blank" rel="noreferrer">
             Exportar Excel
           </a>
