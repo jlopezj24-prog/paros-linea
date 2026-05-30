@@ -74,7 +74,11 @@ export default function CapturaPage() {
         })),
       })
     } else {
-      setMeta(62)
+      // Bloques con override (último de 75 min) usan JPH 76; resto, 62
+      const jphDefault = h.meta_override != null
+        ? Math.round(h.meta_override * 60 / h.minutos)
+        : 62
+      setMeta(jphDefault)
       setForm({ produccion: 0, observaciones: '', paros: [] })
     }
   }
