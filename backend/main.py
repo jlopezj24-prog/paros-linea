@@ -849,19 +849,24 @@ TOTALS_RE = re.compile(r"^totals\s*:", re.IGNORECASE)
 RESOURCE_RE = re.compile(r"^[A-Z][A-Z0-9_]{3,}$")
 
 # Patrones de estación (en orden de prioridad)
+# Prioridad 1: columna física de la planta tipo 17-V4-074L, 17-T4-83R, 18-V3-105L
+#   - permite cualquier letra de área (V/T/...), 1-2 dígitos en la 2a parte,
+#     2-3 dígitos en la 3a parte, sufijo opcional L/R/I/D
+# Prioridad 2: estaciones nombradas (VES4-073I, EOT03, FP69, MFD414, ODT_xxx)
+# Prioridad 3 (fallback): celda/recurso GT_SKL04, CELL3, HMI1
 EST_PATTERNS = [
-    re.compile(r"\b(\d{2}-V\d-\d{3}[A-Z]?)\b"),         # 17-V4-074L
-    re.compile(r"\b(VES\d-\d{3}[A-Z]?)\b"),             # VES4-073I
-    re.compile(r"\b(GT_[A-Z]{2,5}\d{1,3}[A-Z]?)\b"),    # GT_SKL04
-    re.compile(r"\b(FP\d{2,3}[A-Z]?)\b"),               # FP69
-    re.compile(r"\b(EOT\d{1,3}[A-Z]?)\b"),              # EOT05
-    re.compile(r"\b(MFD\d{2,4}[A-Z]?)\b"),              # MFD414
+    re.compile(r"\b(\d{2}-[A-Z]\d{1,2}-\d{2,3}[A-Z]?)\b"),  # 17-V4-074L, 17-T4-83R
+    re.compile(r"\b(VES\d-\d{3}[A-Z]?)\b"),                 # VES4-073I
+    re.compile(r"\b(EOT\d{1,3}[A-Z]?)\b"),                  # EOT03
+    re.compile(r"\b(FP\d{2,3}[A-Z]?)\b"),                   # FP69
+    re.compile(r"\b(MFD\d{2,4}[A-Z]?)\b"),                  # MFD414
     re.compile(r"\b(IFD\d{2,4}[A-Z]?)\b"),
     re.compile(r"\b(TFD\d{2,4}[A-Z]?)\b"),
-    re.compile(r"\b(ODT_[A-Z0-9_]+)\b"),                # ODT_FP_69A_7
-    re.compile(r"\b(CELL\d{1,2})\b"),
-    re.compile(r"\b(HMI\d{1,2}[A-Z]?)\b"),
+    re.compile(r"\b(ODT_[A-Z0-9_]+)\b"),                    # ODT_FP_69A_7
     re.compile(r"\b(STN_?\d{1,3}[A-Z]?)\b"),
+    re.compile(r"\b(HMI\d{1,2}[A-Z]?)\b"),
+    re.compile(r"\b(CELL\d{1,2})\b"),
+    re.compile(r"\b(GT_[A-Z]{2,5}\d{1,3}[A-Z]?)\b"),        # GT_SKL04 (último: es la celda)
 ]
 
 
