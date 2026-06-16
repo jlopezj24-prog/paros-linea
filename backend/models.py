@@ -53,3 +53,52 @@ class Paro(Base):
 
     registro = relationship("RegistroHora", back_populates="paros")
     categoria = relationship("CategoriaParo")
+
+
+class DTRImport(Base):
+    """Carga de un PDF DTR (Top Alarms) por línea + turno + fecha.
+
+    Se acumula en BD para construir un dashboard histórico.
+    Único por (fecha, turno, linea_id) — un nuevo upload reemplaza el anterior.
+    """
+    __tablename__ = "dtr_imports"
+    id = Column(Integer, primary_key=True, index=True)
+    fecha = Column(Date, nullable=False, index=True)
+    turno = Column(String(10), nullable=False, index=True)  # dia | noche
+    linea_id = Column(Integer, ForeignKey("lineas.id"), nullable=False, index=True)
+    sub_area = Column(String(40), default="")
+    start_time = Column(String(10), default="")
+    end_time = Column(String(10), default="")
+    archivo_nombre = Column(String(200), default="")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    linea = relationship("Linea")
+    alarmas = relationship("DTRAlarma", back_populates="dtr_import",
+                           cascade="all, delete-orphan")
+
+
+class DTRAlarma(Base):
+    """Cada fila de alarma del PDF DTR clasificada por su categoría DTR.
+
+    Categorías DTR (independientes de CategoriaParo):
+      FPS   = STOPPED@FPS (Error Proofing)
+      Andon = Team Member Help Call Fault
+      PF    = Over travel
+      MF    = Fallas de mantenimiento
+      TFS   = Vacíos (starvation)
+      TFIB  = Bloqueos (blocking)
+      Otros = no clasificada
+    """
+    __tablename__ = "dtr_alarmas"
+    id = Column(Integer, primary_key=True, index=True)
+    import_id = Column(Integer, ForeignKey("dtr_imports.id", ondelete="CASCADE"),
+                       nullable=False, index=True)
+    resource = Column(String(80), default="")
+    mensaje = Column(Text, default="")
+    categoria_dtr = Column(String(10), nullable=False, index=True)
+    count = Column(Integer, default=0)
+    duracion_min = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    dtr_import = relationship("DTRImport", back_populates="alarmas")
+

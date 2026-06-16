@@ -3,6 +3,7 @@ import CapturaPage from './pages/CapturaPage.jsx'
 import GerencialPage from './pages/GerencialPage.jsx'
 import DashboardPage from './pages/DashboardPage.jsx'
 import ImportarDTRPage from './pages/ImportarDTRPage.jsx'
+import DashboardDTRPage from './pages/DashboardDTRPage.jsx'
 
 const tab = ({ isActive }) =>
   `px-4 py-2 rounded-md text-sm font-medium ${
@@ -20,6 +21,7 @@ export default function App() {
             <NavLink to="/dashboard" className={tab}>Dashboard</NavLink>
             <NavLink to="/gerencial" className={tab}>Gerencial</NavLink>
             <NavLink to="/importar-dtr" className={tab}>Importar DTR</NavLink>
+            <NavLink to="/dashboard-dtr" className={tab}>Dashboard DTR</NavLink>
           </nav>
         </div>
       </header>
@@ -30,6 +32,7 @@ export default function App() {
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/gerencial" element={<GerencialPage />} />
           <Route path="/importar-dtr" element={<ImportarDTRPage />} />
+          <Route path="/dashboard-dtr" element={<DashboardDTRPage />} />
         </Routes>
       </main>
       <footer className="text-center text-xs text-slate-500 py-3">

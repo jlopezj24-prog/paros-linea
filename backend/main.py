@@ -495,6 +495,332 @@ async def parse_dtr_pdf(
     }
 
 
+# -------- Dashboard DTR (acumulado) --------
+# Categorías DTR según el PDF Top Alarms (NO confundir con CategoriaParo)
+DTR_CATEGORIAS = ["FPS", "Andon", "PF", "MF", "TFS", "TFIB", "Otros"]
+DTR_CATEGORIAS_DESC = {
+    "FPS": "Error Proofing",
+    "Andon": "Andon (Help Call)",
+    "PF": "Over travel",
+    "MF": "Mantenimiento",
+    "TFS": "Vacíos (Starvation)",
+    "TFIB": "Bloqueos (Blocking)",
+    "Otros": "Otros",
+}
+
+
+def _clasificar_dtr(mensaje: str) -> str:
+    """Clasifica una alarma DTR en una de las 6 categorías + Otros."""
+    t = (mensaje or "").upper()
+    if "STOPPED@FPS" in t:
+        return "FPS"
+    if "TEAM MEMBER HELP CALL FAULT" in t:
+        return "Andon"
+    # TFIB antes que TFS porque "TFIB" contiene "TF"
+    if t.startswith("TFIB ") or " TFIB " in t:
+        return "TFIB"
+    if t.startswith("TFS ") or " TFS " in t:
+        return "TFS"
+    if t.startswith("PF ") or " PF " in t[:5]:
+        return "PF"
+    if t.startswith("MF ") or " MF " in t[:5]:
+        return "MF"
+    return "Otros"
+
+
+def _parsear_pdf_dtr(contenido: bytes):
+    """Devuelve (texto_completo, lista_de_filas) donde fila = dict con resource, mensaje, count, duracion_min."""
+    try:
+        import pdfplumber
+    except ImportError:
+        raise HTTPException(500, "pdfplumber no instalado en el servidor")
+    texto_paginas = []
+    try:
+        with pdfplumber.open(io.BytesIO(contenido)) as pdf:
+            for page in pdf.pages:
+                texto_paginas.append(page.extract_text() or "")
+    except Exception as e:
+        raise HTTPException(400, f"PDF inválido: {e}")
+    texto = "\n".join(texto_paginas)
+    fila_re = re.compile(
+        r"^(?P<res>\S+)\s+"
+        r"(?P<msg>.+?)\s+"
+        r"(?P<count>\d+)\s+"
+        r"(?P<high>\d{1,2}:\d{2}:\d{2})\s+"
+        r"(?P<total>\d{1,2}:\d{2}:\d{2})\s*$"
+    )
+    filas = []
+    for raw in texto.split("\n"):
+        line = raw.strip()
+        if not line:
+            continue
+        m = fila_re.match(line)
+        if not m:
+            continue
+        msg = m.group("msg").strip()
+        if msg.lower().startswith("alarm message"):
+            continue
+        if "highest alarm" in line.lower() or "report generated" in line.lower():
+            continue
+        dur = _hms_a_min(m.group("total"))
+        if dur <= 0:
+            continue
+        filas.append({
+            "resource": m.group("res"),
+            "mensaje": msg,
+            "count": int(m.group("count")),
+            "duracion_min": dur,
+        })
+    return texto, filas
+
+
+def _meta_dtr_desde_texto(texto: str):
+    """Extrae fecha, start_time, end_time, sub_area del encabezado del PDF."""
+    fecha_match = re.search(r"From:\s*(\d{1,2}/\d{1,2}/\d{2,4})", texto)
+    start_match = re.search(r"Start Time:\s*(\d{1,2}:\d{2})", texto)
+    end_match = re.search(r"End Time:\s*(\d{1,2}:\d{2})", texto)
+    sub_area_match = re.search(r"Sub Area:\s*(\S+)", texto)
+    fecha_iso = None
+    if fecha_match:
+        for fmt in ("%m/%d/%Y", "%m/%d/%y"):
+            try:
+                fecha_iso = datetime.strptime(fecha_match.group(1), fmt).date().isoformat()
+                break
+            except ValueError:
+                pass
+    return {
+        "fecha": fecha_iso,
+        "start_time": start_match.group(1) if start_match else "",
+        "end_time": end_match.group(1) if end_match else "",
+        "sub_area": sub_area_match.group(1) if sub_area_match else "",
+    }
+
+
+@app.post("/api/dtr/ingest")
+async def dtr_ingest(
+    file: UploadFile = File(...),
+    fecha: date_type = Query(...),
+    turno: str = Query(...),  # dia | noche
+    linea_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Sube un PDF DTR y lo persiste para el dashboard acumulado.
+
+    Reemplaza cualquier import previo con la misma (fecha, turno, linea_id).
+    """
+    if turno not in ("dia", "noche"):
+        raise HTTPException(400, "turno debe ser 'dia' o 'noche'")
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Debe ser un archivo PDF")
+    linea = db.query(models.Linea).filter_by(id=linea_id).first()
+    if not linea:
+        raise HTTPException(404, "Línea no encontrada")
+
+    contenido = await file.read()
+    texto, filas = _parsear_pdf_dtr(contenido)
+    if not filas:
+        raise HTTPException(400, "No se detectaron alarmas en el PDF")
+
+    meta_pdf = _meta_dtr_desde_texto(texto)
+
+    # Reemplazar import previo si existe
+    prev = (
+        db.query(models.DTRImport)
+        .filter_by(fecha=fecha, turno=turno, linea_id=linea_id)
+        .first()
+    )
+    if prev:
+        db.delete(prev)
+        db.flush()
+
+    imp = models.DTRImport(
+        fecha=fecha, turno=turno, linea_id=linea_id,
+        sub_area=meta_pdf["sub_area"][:40],
+        start_time=meta_pdf["start_time"][:10],
+        end_time=meta_pdf["end_time"][:10],
+        archivo_nombre=(file.filename or "")[:200],
+    )
+    db.add(imp)
+    db.flush()
+
+    for f in filas:
+        cat = _clasificar_dtr(f["mensaje"])
+        db.add(models.DTRAlarma(
+            import_id=imp.id,
+            resource=f["resource"][:80],
+            mensaje=f["mensaje"][:1000],
+            categoria_dtr=cat,
+            count=f["count"],
+            duracion_min=f["duracion_min"],
+        ))
+    db.commit()
+    db.refresh(imp)
+
+    return {
+        "id": imp.id,
+        "fecha": imp.fecha.isoformat(),
+        "turno": imp.turno,
+        "linea_id": imp.linea_id,
+        "linea_nombre": linea.nombre,
+        "sub_area": imp.sub_area,
+        "start_time": imp.start_time,
+        "end_time": imp.end_time,
+        "alarmas_total": len(filas),
+        "duracion_total_min": round(sum(f["duracion_min"] for f in filas), 2),
+    }
+
+
+@app.get("/api/dtr/imports")
+def dtr_imports_list(
+    fecha_desde: Optional[date_type] = None,
+    fecha_hasta: Optional[date_type] = None,
+    linea_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    q = db.query(models.DTRImport)
+    if fecha_desde:
+        q = q.filter(models.DTRImport.fecha >= fecha_desde)
+    if fecha_hasta:
+        q = q.filter(models.DTRImport.fecha <= fecha_hasta)
+    if linea_id:
+        q = q.filter(models.DTRImport.linea_id == linea_id)
+    imps = q.order_by(models.DTRImport.fecha.desc(),
+                      models.DTRImport.turno).all()
+    out = []
+    for i in imps:
+        total_min = sum(a.duracion_min for a in i.alarmas)
+        out.append({
+            "id": i.id,
+            "fecha": i.fecha.isoformat(),
+            "turno": i.turno,
+            "linea_id": i.linea_id,
+            "linea_nombre": i.linea.nombre,
+            "sub_area": i.sub_area,
+            "start_time": i.start_time,
+            "end_time": i.end_time,
+            "archivo_nombre": i.archivo_nombre,
+            "alarmas_total": len(i.alarmas),
+            "duracion_total_min": round(total_min, 2),
+            "created_at": i.created_at.isoformat() if i.created_at else None,
+        })
+    return out
+
+
+@app.delete("/api/dtr/imports/{imp_id}")
+def dtr_import_delete(imp_id: int, db: Session = Depends(get_db)):
+    imp = db.query(models.DTRImport).get(imp_id)
+    if not imp:
+        raise HTTPException(404)
+    db.delete(imp)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/dtr/dashboard")
+def dtr_dashboard(
+    fecha_desde: Optional[date_type] = None,
+    fecha_hasta: Optional[date_type] = None,
+    linea_id: Optional[int] = None,
+    categoria: Optional[str] = None,  # filtro por categoría DTR
+    top_n: int = Query(15, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Métricas agregadas para el dashboard DTR.
+
+    Devuelve:
+      resumen: { total_paros, total_min, total_imports }
+      por_categoria: [{categoria, descripcion, count_total, duracion_min}]
+      top_alarmas_duracion: [{mensaje, count, duracion_min, categoria}]
+      top_alarmas_frecuencia: [{...}]
+      tendencia_diaria: [{fecha, duracion_min, count_total}]
+    """
+    q = (
+        db.query(models.DTRAlarma, models.DTRImport)
+        .join(models.DTRImport, models.DTRAlarma.import_id == models.DTRImport.id)
+    )
+    if fecha_desde:
+        q = q.filter(models.DTRImport.fecha >= fecha_desde)
+    if fecha_hasta:
+        q = q.filter(models.DTRImport.fecha <= fecha_hasta)
+    if linea_id:
+        q = q.filter(models.DTRImport.linea_id == linea_id)
+    if categoria and categoria in DTR_CATEGORIAS:
+        q = q.filter(models.DTRAlarma.categoria_dtr == categoria)
+
+    rows = q.all()
+    if not rows:
+        return {
+            "resumen": {"total_paros": 0, "total_min": 0.0, "total_imports": 0},
+            "por_categoria": [],
+            "top_alarmas_duracion": [],
+            "top_alarmas_frecuencia": [],
+            "tendencia_diaria": [],
+        }
+
+    # Resumen global
+    total_min = sum(a.duracion_min for a, _ in rows)
+    total_paros = sum(a.count for a, _ in rows)
+    total_imports = len({i.id for _, i in rows})
+
+    # Por categoría
+    cat_acum = {c: {"count_total": 0, "duracion_min": 0.0} for c in DTR_CATEGORIAS}
+    for a, _ in rows:
+        bucket = cat_acum.get(a.categoria_dtr) or cat_acum["Otros"]
+        bucket["count_total"] += a.count
+        bucket["duracion_min"] += a.duracion_min
+    por_categoria = []
+    for c in DTR_CATEGORIAS:
+        v = cat_acum[c]
+        por_categoria.append({
+            "categoria": c,
+            "descripcion": DTR_CATEGORIAS_DESC[c],
+            "count_total": v["count_total"],
+            "duracion_min": round(v["duracion_min"], 2),
+        })
+
+    # Top alarmas — agrupa por mensaje (normalizado a 200 chars)
+    agrup = {}
+    for a, _ in rows:
+        key = (a.categoria_dtr, a.mensaje[:200])
+        if key not in agrup:
+            agrup[key] = {
+                "mensaje": a.mensaje[:200],
+                "categoria": a.categoria_dtr,
+                "count": 0, "duracion_min": 0.0,
+            }
+        agrup[key]["count"] += a.count
+        agrup[key]["duracion_min"] += a.duracion_min
+    lista = list(agrup.values())
+    for it in lista:
+        it["duracion_min"] = round(it["duracion_min"], 2)
+    top_dur = sorted(lista, key=lambda x: x["duracion_min"], reverse=True)[:top_n]
+    top_freq = sorted(lista, key=lambda x: x["count"], reverse=True)[:top_n]
+
+    # Tendencia diaria
+    dia_acum = {}
+    for a, i in rows:
+        k = i.fecha.isoformat()
+        if k not in dia_acum:
+            dia_acum[k] = {"fecha": k, "duracion_min": 0.0, "count_total": 0}
+        dia_acum[k]["duracion_min"] += a.duracion_min
+        dia_acum[k]["count_total"] += a.count
+    tendencia = sorted(dia_acum.values(), key=lambda x: x["fecha"])
+    for d in tendencia:
+        d["duracion_min"] = round(d["duracion_min"], 2)
+
+    return {
+        "resumen": {
+            "total_paros": total_paros,
+            "total_min": round(total_min, 2),
+            "total_imports": total_imports,
+        },
+        "por_categoria": por_categoria,
+        "top_alarmas_duracion": top_dur,
+        "top_alarmas_frecuencia": top_freq,
+        "tendencia_diaria": tendencia,
+    }
+
+
 # -------- Reporte gerencial --------
 def _check_gerente(password: str):
     # Acceso libre: validación eliminada por solicitud del usuario.
