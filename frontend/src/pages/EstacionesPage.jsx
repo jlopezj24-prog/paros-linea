@@ -46,6 +46,7 @@ export default function EstacionesPage() {
   const [cargaLinea, setCargaLinea] = useState('')
   const [cargando, setCargando] = useState(false)
   const [msg, setMsg] = useState('')
+  const [preview, setPreview] = useState(null)
 
   useEffect(() => {
     api.get('/lineas').then(r => setLineas(r.data))
@@ -124,6 +125,26 @@ export default function EstacionesPage() {
     }
   }
 
+  async function vistaPrevia() {
+    if (!archivo) { alert('Selecciona PDF'); return }
+    setCargando(true)
+    setMsg('Analizando PDF (sin guardar)…')
+    try {
+      const fd = new FormData()
+      fd.append('file', archivo)
+      const r = await api.post('/alarm-history/preview', fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      setPreview(r.data)
+      setMsg('')
+    } catch (e) {
+      const det = e?.response?.data?.detail || e?.message
+      alert(`Error: ${typeof det === 'string' ? det : JSON.stringify(det)}`)
+    } finally {
+      setCargando(false)
+    }
+  }
+
   const cats = data?.por_categoria || []
   const tendencia = data?.tendencia_diaria || []
   const horaria = data?.distribucion_horaria || []
@@ -186,8 +207,12 @@ export default function EstacionesPage() {
           </div>
           <div className="col-span-2 flex items-end gap-2">
             <input id="ah-file-input" type="file" accept="application/pdf"
-                   onChange={e => setArchivo(e.target.files?.[0] || null)}
+                   onChange={e => { setArchivo(e.target.files?.[0] || null); setPreview(null) }}
                    className="text-sm flex-1" />
+            <button onClick={vistaPrevia} disabled={cargando || !archivo}
+                    className="bg-slate-200 hover:bg-slate-300 text-slate-800 text-sm px-3 py-2 rounded disabled:opacity-50">
+              Vista previa
+            </button>
             <button onClick={subir} disabled={cargando}
                     className="bg-blue-600 text-white text-sm px-4 py-2 rounded hover:bg-blue-700 disabled:opacity-50">
               {cargando ? 'Procesando…' : 'Subir Alarm History'}
@@ -195,6 +220,54 @@ export default function EstacionesPage() {
           </div>
         </div>
         {msg && <div className="mt-2 text-sm text-slate-600">{msg}</div>}
+        {preview && (
+          <div className="mt-3 bg-slate-50 border border-slate-200 rounded p-3 text-xs">
+            <div className="font-semibold mb-2 text-slate-700">
+              Diagnóstico parser · {preview.diagnostico.bloques_detectados} bloques · {preview.diagnostico.eventos_total} eventos · {preview.estaciones_distintas} estaciones distintas
+              {preview.diagnostico.eventos_descartados > 0 && (
+                <span className="text-amber-600"> · {preview.diagnostico.eventos_descartados} eventos descartados</span>
+              )}
+            </div>
+            <div className="grid md:grid-cols-2 gap-3">
+              <div>
+                <div className="font-medium mb-1">Top estaciones detectadas:</div>
+                {preview.estaciones.length === 0
+                  ? <div className="text-red-600">⚠ Ninguna estación detectada. Comparte las primeras líneas del PDF (panel derecho) para ajustar el parser.</div>
+                  : (
+                    <table className="w-full">
+                      <thead><tr className="bg-slate-200"><th className="text-left p-1">Estación</th><th className="text-right p-1">Eventos</th><th className="text-right p-1">Min</th></tr></thead>
+                      <tbody>
+                        {preview.estaciones.map((e, i) => (
+                          <tr key={i} className="border-b border-slate-200">
+                            <td className="p-1">{e.estacion}</td>
+                            <td className="p-1 text-right">{e.count}</td>
+                            <td className="p-1 text-right">{e.duracion_min}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )
+                }
+              </div>
+              <div>
+                <div className="font-medium mb-1">Primeros eventos (con estación + mensaje):</div>
+                <div className="bg-white border border-slate-200 rounded p-2 max-h-48 overflow-auto font-mono text-[11px] space-y-1">
+                  {preview.primeros_eventos.map((e, i) => (
+                    <div key={i} className="border-b border-slate-100 pb-1">
+                      <span className="font-bold text-slate-800">[{e.estacion}]</span>
+                      <span className="text-slate-500"> {e.categoria_dtr} · {e.duracion_min}min · {e.start_time.slice(11, 19)}</span>
+                      <div className="text-slate-600 truncate">{e.mensaje}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="font-medium mt-2 mb-1">Primeras líneas del PDF (texto crudo):</div>
+                <pre className="bg-white border border-slate-200 rounded p-2 max-h-32 overflow-auto font-mono text-[10px] whitespace-pre-wrap">
+{preview.primeras_lineas_pdf.join('\n')}
+                </pre>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* FILTROS */}
@@ -303,21 +376,28 @@ export default function EstacionesPage() {
         <p className="text-xs text-slate-500 mb-3">
           Click en una barra para ver detalle de la estación. Color por categoría dominante.
         </p>
-        <div style={{ width: '100%', height: 30 + topDurChart.length * 28 }}>
-          <ResponsiveContainer>
-            <BarChart data={topDurChart} layout="vertical" margin={{ left: 100 }}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis type="number" />
-              <YAxis type="category" dataKey="estacion" width={140} fontSize={11}
-                     onClick={(d) => setEstacionFiltro(d.value)} cursor="pointer" />
-              <Tooltip formatter={(v, n) => n === 'duracion_min' ? `${v} min` : v} />
-              <Legend />
-              <Bar dataKey="duracion_min" name="Min" onClick={(d) => setEstacionFiltro(d.estacion)} cursor="pointer">
-                {topDurChart.map((t, i) => <Cell key={i} fill={t.color} />)}
-              </Bar>
-            </BarChart>
-          </ResponsiveContainer>
-        </div>
+        {topDurChart.length === 0
+          ? <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded p-3">
+              Sin estaciones para mostrar con los filtros actuales. Sube un PDF con el botón <b>Vista previa</b> arriba para validar que el parser detecte las estaciones correctamente.
+            </div>
+          : (
+            <div style={{ width: '100%', height: 30 + topDurChart.length * 28 }}>
+              <ResponsiveContainer>
+                <BarChart data={topDurChart} layout="vertical" margin={{ left: 100 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis type="number" />
+                  <YAxis type="category" dataKey="estacion" width={140} fontSize={11}
+                         onClick={(d) => setEstacionFiltro(d.value)} cursor="pointer" />
+                  <Tooltip formatter={(v, n) => n === 'duracion_min' ? `${v} min` : v} />
+                  <Legend />
+                  <Bar dataKey="duracion_min" name="Min" onClick={(d) => setEstacionFiltro(d.estacion)} cursor="pointer">
+                    {topDurChart.map((t, i) => <Cell key={i} fill={t.color} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          )
+        }
       </div>
 
       {/* PARETO TOP ESTACIONES POR FRECUENCIA */}

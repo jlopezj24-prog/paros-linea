@@ -839,44 +839,78 @@ EVENTO_RE = re.compile(
     r"(?P<raw>\d{1,2}:\d{2}:\d{2})\s*$"
 )
 
-# Header station: 17-V4-074L, 17-V3-048R, VES4-073I, etc.
-ESTACION_RE = re.compile(r"^(\d{2}-V\d-\d{3}[LRD]?|VES\d-\d{3}[IDLR]?)\b")
+# Ancla del bloque: la línea "Start Time End Time Adjusted Duration Scaled Duration Raw Duration"
+START_TIME_ANCHOR = re.compile(r"^start\s+time\s+end\s+time\s+adjusted", re.IGNORECASE)
+
+# Totals: 00:00:08 00:00:08 00:00:08
+TOTALS_RE = re.compile(r"^totals\s*:", re.IGNORECASE)
+
+# Línea de resource (un solo token tipo G1TRIM4C_VES4)
+RESOURCE_RE = re.compile(r"^[A-Z][A-Z0-9_]{3,}$")
+
+# Patrones de estación (en orden de prioridad)
+EST_PATTERNS = [
+    re.compile(r"\b(\d{2}-V\d-\d{3}[A-Z]?)\b"),         # 17-V4-074L
+    re.compile(r"\b(VES\d-\d{3}[A-Z]?)\b"),             # VES4-073I
+    re.compile(r"\b(GT_[A-Z]{2,5}\d{1,3}[A-Z]?)\b"),    # GT_SKL04
+    re.compile(r"\b(FP\d{2,3}[A-Z]?)\b"),               # FP69
+    re.compile(r"\b(EOT\d{1,3}[A-Z]?)\b"),              # EOT05
+    re.compile(r"\b(MFD\d{2,4}[A-Z]?)\b"),              # MFD414
+    re.compile(r"\b(IFD\d{2,4}[A-Z]?)\b"),
+    re.compile(r"\b(TFD\d{2,4}[A-Z]?)\b"),
+    re.compile(r"\b(ODT_[A-Z0-9_]+)\b"),                # ODT_FP_69A_7
+    re.compile(r"\b(CELL\d{1,2})\b"),
+    re.compile(r"\b(HMI\d{1,2}[A-Z]?)\b"),
+    re.compile(r"\b(STN_?\d{1,3}[A-Z]?)\b"),
+]
 
 
 def _extraer_estacion(header: str) -> str:
-    """Devuelve la estación a partir del header del bloque de alarma.
+    """Devuelve la mejor estimación de la estación a partir del header del bloque.
 
-    - "17-V4-074L TT STOPPED@FPS ..."  -> "17-V4-074L"
-    - "VES4-073I Team Member Help ..." -> "VES4-073I"
-    - "MF GT_SKL04 ODT_FP_69A_7 FP69 ..." -> "FP69" (primer FPxx que aparezca)
-    - "PF GT_SKL04 CELL3 EOT05 ..."     -> "EOT05"
-    - "TFIB GT_SKL04 MFD414 ..."        -> "MFD414"
-    - "TFS GT_SKL04 MFD414 ..."         -> "MFD414"
-    - cualquier otro                     -> primer token significativo
+    Prioriza patrones específicos. Si no matchea ninguno, usa los primeros tokens
+    relevantes (saltando prefijos genéricos MF/PF/TFS/TFIB/TF/QF y palabras muy
+    comunes como GT_SKL04/STOPPED@/Team).
     """
-    h = header.strip()
-    m = ESTACION_RE.match(h)
-    if m:
-        return m.group(1)
-    # Buscar tokens FPxx, EOTxx, IFDxxx, MFDxxx
-    sub = re.search(r"\b(FP\d{1,3}|EOT\d{1,3}|IFD\d{2,4}|MFD\d{2,4}|TFD\d{2,4}|CELL\d|HMI\d)\b", h.upper())
-    if sub:
-        return sub.group(1)
-    # Fallback: primer token tras el prefijo MF/PF/TFIB/TFS/QF/TF
-    parts = h.split()
-    if len(parts) >= 3 and parts[0].upper() in ("MF", "PF", "TFIB", "TFS", "QF", "TF"):
-        return parts[2][:30]
-    if parts:
-        return parts[0][:30]
-    return "(sin estación)"
+    h = (header or "").strip()
+    if not h:
+        return "(sin estación)"
+    up = h.upper()
+    # 1) Probar patrones específicos
+    for rx in EST_PATTERNS:
+        m = rx.search(up)
+        if m:
+            return m.group(1)
+    # 2) Fallback: primer token significativo
+    tokens = h.split()
+    GENERIC = {"MF", "PF", "TFS", "TFIB", "TF", "QF", "STOPPED@FPS",
+               "TEAM", "MEMBER", "HELP", "CALL", "FAULT"}
+    for t in tokens:
+        tu = t.upper().rstrip(":,;.")
+        if tu in GENERIC or len(tu) < 3:
+            continue
+        return tu[:40]
+    return tokens[0][:40] if tokens else "(sin estación)"
 
 
 def _parsear_alarm_history(contenido: bytes):
-    """Parsea PDF Alarm History Report. Devuelve (texto_completo, lista_eventos).
+    """Parsea PDF Alarm History Report.
 
-    Cada evento es dict: { estacion, mensaje, categoria_dtr, start_time (datetime),
-                           end_time (datetime|None), adjusted_duration_min,
-                           raw_duration_min }
+    Estructura del PDF:
+      [metadata global del reporte]
+      <header bloque, posible multilínea: estación + mensaje>
+      Start Time End Time Adjusted Duration Scaled Duration Raw Duration
+      <resource id, p.ej. G1TRIM4C_VES4>
+      <fila evento> ...
+      Totals: HH:MM:SS HH:MM:SS HH:MM:SS
+      <header siguiente bloque>
+      Start Time End Time ...
+
+    Estrategia: usar la línea "Start Time..." como ancla. Todo lo acumulado
+    desde el último Totals (o desde el inicio) hasta esa ancla se concatena
+    como header del bloque. Las líneas de metadata global se filtran.
+
+    Devuelve (texto_completo, lista_eventos, info_diagnostico).
     """
     try:
         import pdfplumber
@@ -892,18 +926,23 @@ def _parsear_alarm_history(contenido: bytes):
     texto = "\n".join(texto_paginas)
     lineas = texto.split("\n")
 
-    eventos = []
-    header_actual = None       # último header de bloque visto (mensaje + estación)
-    categoria_actual = "Otros"
-    estacion_actual = ""
-
-    HEADER_NOISE = (
-        "alarm message", "start time", "end time", "report generated",
-        "from:", "to:", "shift:", "sorted by:", "discard duration",
-        "discard type", "area:", "sub area:", "resource", "totals:",
-        "highest alarm", "report totals", "alarm history report",
-        "page ", "g1trim",  # ignora líneas con solo el resource id
+    # Líneas de ruido global (case-insensitive startswith)
+    NOISE_PREFIX = (
+        "alarm history report", "alarm message", "report generated",
+        "report totals", "highest alarm", "from:", "to:", "shift:",
+        "sorted by:", "discard duration", "discard type",
+        "area:", "sub area:", "line:", "department:", "plant:",
     )
+
+    eventos = []
+    header_buffer = []
+    in_block = False  # estamos entre el ancla "Start Time..." y el siguiente "Totals:"
+    header_actual = ""
+    categoria_actual = "Otros"
+    estacion_actual = "(sin estación)"
+
+    bloques_detectados = 0
+    eventos_descartados = 0
 
     for raw in lineas:
         line = raw.strip()
@@ -911,19 +950,35 @@ def _parsear_alarm_history(contenido: bytes):
             continue
         low = line.lower()
 
-        # Filtra ruido / metadata
-        if any(low.startswith(p) for p in HEADER_NOISE):
+        # Filtrar metadata global del reporte
+        if any(low.startswith(p) for p in NOISE_PREFIX):
             continue
-        if low == "g1trim4c_ves4" or low.startswith("g1trim4"):
+        if low.startswith("page ") and "/" in low:
             continue
-        if "page " in low and "/ " in low:
+
+        # ¿Es la línea ancla "Start Time End Time Adjusted Duration Scaled..."?
+        if START_TIME_ANCHOR.match(line):
+            if header_buffer:
+                header_actual = " ".join(header_buffer).strip()
+                categoria_actual = _clasificar_dtr(header_actual)
+                estacion_actual = _extraer_estacion(header_actual)[:80]
+                header_buffer = []
+                bloques_detectados += 1
+            in_block = True
+            continue
+
+        # ¿Es "Totals: ..."?  cierra el bloque
+        if TOTALS_RE.match(line):
+            in_block = False
+            header_buffer = []
             continue
 
         # ¿Es una fila de evento?
         m = EVENTO_RE.match(line)
         if m:
             if not header_actual:
-                continue  # evento huérfano sin header; ignorar
+                eventos_descartados += 1
+                continue
             try:
                 fecha_iso = datetime.strptime(m.group("sd"), "%m/%d/%Y").date()
                 hh, mm, ss = m.group("st").split(":")
@@ -940,6 +995,7 @@ def _parsear_alarm_history(contenido: bytes):
                 end_dt = datetime(fecha_e.year, fecha_e.month, fecha_e.day,
                                   hh2, int(mm2), int(ss2))
             except Exception:
+                eventos_descartados += 1
                 continue
             adj_seg = _hms_a_seg(m.group("adj"))
             raw_seg = _hms_a_seg(m.group("raw"))
@@ -955,14 +1011,67 @@ def _parsear_alarm_history(contenido: bytes):
             })
             continue
 
-        # Si no es evento ni ruido, asumimos que es un nuevo header de bloque
-        # (puede ser estación + mensaje, o "MF GT_SKL04 ...")
-        if len(line) > 5:
-            header_actual = line
-            categoria_actual = _clasificar_dtr(line)
-            estacion_actual = _extraer_estacion(line)[:80]
+        # Línea de resource id (un solo token tipo G1TRIM4C_VES4) dentro del bloque
+        if in_block and RESOURCE_RE.match(line) and " " not in line:
+            continue
 
-    return texto, eventos
+        # Si llegamos aquí: línea suelta. Si NO estamos en un bloque, la
+        # acumulamos como parte del próximo header (header multilínea).
+        if not in_block:
+            header_buffer.append(line)
+        else:
+            # Estamos in_block pero apareció algo inesperado; lo más probable
+            # es que sea un header del siguiente bloque que cruza página.
+            in_block = False
+            header_buffer = [line]
+
+    diagnostico = {
+        "bloques_detectados": bloques_detectados,
+        "eventos_total": len(eventos),
+        "eventos_descartados": eventos_descartados,
+        "lineas_pdf": len(lineas),
+    }
+    return texto, eventos, diagnostico
+
+
+@app.post("/api/alarm-history/preview")
+async def alarm_history_preview(file: UploadFile = File(...)):
+    """Diagnóstico: parsea el PDF y devuelve muestra para validar el parser
+    sin persistir nada. Útil cuando "no aparecen estaciones".
+    """
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Debe ser un archivo PDF")
+    contenido = await file.read()
+    texto, eventos, diag = _parsear_alarm_history(contenido)
+    # Resumen por estación
+    por_est = {}
+    for e in eventos:
+        k = e["estacion"]
+        if k not in por_est:
+            por_est[k] = {"estacion": k, "count": 0, "duracion_min": 0.0,
+                          "categoria_top": e["categoria_dtr"]}
+        por_est[k]["count"] += 1
+        por_est[k]["duracion_min"] += e["adjusted_duration_min"]
+    estaciones = sorted(por_est.values(), key=lambda x: x["duracion_min"],
+                        reverse=True)
+    for it in estaciones:
+        it["duracion_min"] = round(it["duracion_min"], 2)
+    return {
+        "diagnostico": diag,
+        "estaciones_distintas": len(por_est),
+        "estaciones": estaciones[:30],
+        "primeras_lineas_pdf": texto.split("\n")[:30],
+        "primeros_eventos": [
+            {
+                "estacion": e["estacion"],
+                "mensaje": e["mensaje"][:120],
+                "categoria_dtr": e["categoria_dtr"],
+                "start_time": e["start_time"].isoformat(),
+                "duracion_min": e["adjusted_duration_min"],
+            }
+            for e in eventos[:10]
+        ],
+    }
 
 
 @app.post("/api/alarm-history/ingest")
@@ -986,9 +1095,13 @@ async def alarm_history_ingest(
         raise HTTPException(404, "Línea no encontrada")
 
     contenido = await file.read()
-    texto_pdf, eventos = _parsear_alarm_history(contenido)
+    texto_pdf, eventos, diag = _parsear_alarm_history(contenido)
     if not eventos:
-        raise HTTPException(400, "No se detectaron eventos en el PDF")
+        raise HTTPException(
+            400,
+            f"No se detectaron eventos en el PDF. Diagnóstico: {diag}. "
+            "Usa /api/alarm-history/preview para ver primeras líneas del PDF."
+        )
 
     # Best-effort sub_area extraction de las primeras líneas
     sub_area = ""
@@ -1043,6 +1156,7 @@ async def alarm_history_ingest(
         "eventos_total": len(eventos),
         "duracion_total_min": round(total_min, 2),
         "estaciones_distintas": len({e["estacion"] for e in eventos}),
+        "diagnostico": diag,
     }
 
 
