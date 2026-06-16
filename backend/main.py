@@ -821,6 +821,410 @@ def dtr_dashboard(
     }
 
 
+# -------- Alarm History Report (eventos individuales por estación) --------
+def _hms_a_seg(hms: str) -> int:
+    try:
+        h, m, s = hms.strip().split(":")
+        return int(h) * 3600 + int(m) * 60 + int(s)
+    except Exception:
+        return 0
+
+
+# Línea de evento: "6/11/2026 1:11:44AM 6/11/2026 1:11:47AM 00:00:03 00:00:03 00:00:03"
+EVENTO_RE = re.compile(
+    r"^(?P<sd>\d{1,2}/\d{1,2}/\d{4})\s+(?P<st>\d{1,2}:\d{2}:\d{2})(?P<sap>AM|PM)\s+"
+    r"(?P<ed>\d{1,2}/\d{1,2}/\d{4})\s+(?P<et>\d{1,2}:\d{2}:\d{2})(?P<eap>AM|PM)\s+"
+    r"(?P<adj>\d{1,2}:\d{2}:\d{2})\s+"
+    r"(?P<scaled>\d{1,2}:\d{2}:\d{2})\s+"
+    r"(?P<raw>\d{1,2}:\d{2}:\d{2})\s*$"
+)
+
+# Header station: 17-V4-074L, 17-V3-048R, VES4-073I, etc.
+ESTACION_RE = re.compile(r"^(\d{2}-V\d-\d{3}[LRD]?|VES\d-\d{3}[IDLR]?)\b")
+
+
+def _extraer_estacion(header: str) -> str:
+    """Devuelve la estación a partir del header del bloque de alarma.
+
+    - "17-V4-074L TT STOPPED@FPS ..."  -> "17-V4-074L"
+    - "VES4-073I Team Member Help ..." -> "VES4-073I"
+    - "MF GT_SKL04 ODT_FP_69A_7 FP69 ..." -> "FP69" (primer FPxx que aparezca)
+    - "PF GT_SKL04 CELL3 EOT05 ..."     -> "EOT05"
+    - "TFIB GT_SKL04 MFD414 ..."        -> "MFD414"
+    - "TFS GT_SKL04 MFD414 ..."         -> "MFD414"
+    - cualquier otro                     -> primer token significativo
+    """
+    h = header.strip()
+    m = ESTACION_RE.match(h)
+    if m:
+        return m.group(1)
+    # Buscar tokens FPxx, EOTxx, IFDxxx, MFDxxx
+    sub = re.search(r"\b(FP\d{1,3}|EOT\d{1,3}|IFD\d{2,4}|MFD\d{2,4}|TFD\d{2,4}|CELL\d|HMI\d)\b", h.upper())
+    if sub:
+        return sub.group(1)
+    # Fallback: primer token tras el prefijo MF/PF/TFIB/TFS/QF/TF
+    parts = h.split()
+    if len(parts) >= 3 and parts[0].upper() in ("MF", "PF", "TFIB", "TFS", "QF", "TF"):
+        return parts[2][:30]
+    if parts:
+        return parts[0][:30]
+    return "(sin estación)"
+
+
+def _parsear_alarm_history(contenido: bytes):
+    """Parsea PDF Alarm History Report. Devuelve (texto_completo, lista_eventos).
+
+    Cada evento es dict: { estacion, mensaje, categoria_dtr, start_time (datetime),
+                           end_time (datetime|None), adjusted_duration_min,
+                           raw_duration_min }
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        raise HTTPException(500, "pdfplumber no instalado en el servidor")
+    texto_paginas = []
+    try:
+        with pdfplumber.open(io.BytesIO(contenido)) as pdf:
+            for page in pdf.pages:
+                texto_paginas.append(page.extract_text() or "")
+    except Exception as e:
+        raise HTTPException(400, f"PDF inválido: {e}")
+    texto = "\n".join(texto_paginas)
+    lineas = texto.split("\n")
+
+    eventos = []
+    header_actual = None       # último header de bloque visto (mensaje + estación)
+    categoria_actual = "Otros"
+    estacion_actual = ""
+
+    HEADER_NOISE = (
+        "alarm message", "start time", "end time", "report generated",
+        "from:", "to:", "shift:", "sorted by:", "discard duration",
+        "discard type", "area:", "sub area:", "resource", "totals:",
+        "highest alarm", "report totals", "alarm history report",
+        "page ", "g1trim",  # ignora líneas con solo el resource id
+    )
+
+    for raw in lineas:
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+
+        # Filtra ruido / metadata
+        if any(low.startswith(p) for p in HEADER_NOISE):
+            continue
+        if low == "g1trim4c_ves4" or low.startswith("g1trim4"):
+            continue
+        if "page " in low and "/ " in low:
+            continue
+
+        # ¿Es una fila de evento?
+        m = EVENTO_RE.match(line)
+        if m:
+            if not header_actual:
+                continue  # evento huérfano sin header; ignorar
+            try:
+                fecha_iso = datetime.strptime(m.group("sd"), "%m/%d/%Y").date()
+                hh, mm, ss = m.group("st").split(":")
+                hh = int(hh) % 12
+                if m.group("sap") == "PM":
+                    hh += 12
+                start_dt = datetime(fecha_iso.year, fecha_iso.month, fecha_iso.day,
+                                    hh, int(mm), int(ss))
+                fecha_e = datetime.strptime(m.group("ed"), "%m/%d/%Y").date()
+                hh2, mm2, ss2 = m.group("et").split(":")
+                hh2 = int(hh2) % 12
+                if m.group("eap") == "PM":
+                    hh2 += 12
+                end_dt = datetime(fecha_e.year, fecha_e.month, fecha_e.day,
+                                  hh2, int(mm2), int(ss2))
+            except Exception:
+                continue
+            adj_seg = _hms_a_seg(m.group("adj"))
+            raw_seg = _hms_a_seg(m.group("raw"))
+            eventos.append({
+                "estacion": estacion_actual,
+                "mensaje": header_actual[:1000],
+                "categoria_dtr": categoria_actual,
+                "start_time": start_dt,
+                "end_time": end_dt,
+                "hora_dia": start_dt.hour,
+                "adjusted_duration_min": round(adj_seg / 60.0, 4),
+                "raw_duration_min": round(raw_seg / 60.0, 4),
+            })
+            continue
+
+        # Si no es evento ni ruido, asumimos que es un nuevo header de bloque
+        # (puede ser estación + mensaje, o "MF GT_SKL04 ...")
+        if len(line) > 5:
+            header_actual = line
+            categoria_actual = _clasificar_dtr(line)
+            estacion_actual = _extraer_estacion(line)[:80]
+
+    return texto, eventos
+
+
+@app.post("/api/alarm-history/ingest")
+async def alarm_history_ingest(
+    file: UploadFile = File(...),
+    fecha: date_type = Query(...),
+    turno: str = Query(...),
+    linea_id: int = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Sube PDF Alarm History Report y persiste eventos individuales.
+
+    Reemplaza cualquier import previo con la misma (fecha, turno, linea_id).
+    """
+    if turno not in ("dia", "noche"):
+        raise HTTPException(400, "turno debe ser 'dia' o 'noche'")
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(400, "Debe ser un archivo PDF")
+    linea = db.query(models.Linea).filter_by(id=linea_id).first()
+    if not linea:
+        raise HTTPException(404, "Línea no encontrada")
+
+    contenido = await file.read()
+    texto_pdf, eventos = _parsear_alarm_history(contenido)
+    if not eventos:
+        raise HTTPException(400, "No se detectaron eventos en el PDF")
+
+    # Best-effort sub_area extraction de las primeras líneas
+    sub_area = ""
+    for ln in (texto_pdf or "").split("\n")[:30]:
+        m = re.search(r"Sub Area:\s*(\S+)", ln)
+        if m:
+            sub_area = m.group(1)
+            break
+
+    # Reemplazar import previo
+    prev = (
+        db.query(models.AlarmHistoryImport)
+        .filter_by(fecha=fecha, turno=turno, linea_id=linea_id)
+        .first()
+    )
+    if prev:
+        db.delete(prev)
+        db.flush()
+
+    imp = models.AlarmHistoryImport(
+        fecha=fecha, turno=turno, linea_id=linea_id,
+        sub_area=sub_area[:40],
+        archivo_nombre=(file.filename or "")[:200],
+    )
+    db.add(imp)
+    db.flush()
+
+    total_min = 0.0
+    for e in eventos:
+        db.add(models.AlarmHistoryEvent(
+            import_id=imp.id,
+            estacion=e["estacion"],
+            mensaje=e["mensaje"],
+            categoria_dtr=e["categoria_dtr"],
+            start_time=e["start_time"],
+            end_time=e["end_time"],
+            hora_dia=e["hora_dia"],
+            adjusted_duration_min=e["adjusted_duration_min"],
+            raw_duration_min=e["raw_duration_min"],
+        ))
+        total_min += e["adjusted_duration_min"]
+    db.commit()
+    db.refresh(imp)
+
+    return {
+        "id": imp.id,
+        "fecha": imp.fecha.isoformat(),
+        "turno": imp.turno,
+        "linea_id": imp.linea_id,
+        "linea_nombre": linea.nombre,
+        "sub_area": imp.sub_area,
+        "eventos_total": len(eventos),
+        "duracion_total_min": round(total_min, 2),
+        "estaciones_distintas": len({e["estacion"] for e in eventos}),
+    }
+
+
+@app.get("/api/alarm-history/imports")
+def alarm_history_list(
+    fecha_desde: Optional[date_type] = None,
+    fecha_hasta: Optional[date_type] = None,
+    linea_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    q = db.query(models.AlarmHistoryImport)
+    if fecha_desde:
+        q = q.filter(models.AlarmHistoryImport.fecha >= fecha_desde)
+    if fecha_hasta:
+        q = q.filter(models.AlarmHistoryImport.fecha <= fecha_hasta)
+    if linea_id:
+        q = q.filter(models.AlarmHistoryImport.linea_id == linea_id)
+    imps = q.order_by(models.AlarmHistoryImport.fecha.desc(),
+                      models.AlarmHistoryImport.turno).all()
+    out = []
+    for i in imps:
+        total_min = sum(e.adjusted_duration_min for e in i.eventos)
+        out.append({
+            "id": i.id,
+            "fecha": i.fecha.isoformat(),
+            "turno": i.turno,
+            "linea_id": i.linea_id,
+            "linea_nombre": i.linea.nombre,
+            "sub_area": i.sub_area,
+            "archivo_nombre": i.archivo_nombre,
+            "eventos_total": len(i.eventos),
+            "duracion_total_min": round(total_min, 2),
+            "created_at": i.created_at.isoformat() if i.created_at else None,
+        })
+    return out
+
+
+@app.delete("/api/alarm-history/imports/{imp_id}")
+def alarm_history_delete(imp_id: int, db: Session = Depends(get_db)):
+    imp = db.query(models.AlarmHistoryImport).get(imp_id)
+    if not imp:
+        raise HTTPException(404)
+    db.delete(imp)
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/alarm-history/dashboard")
+def alarm_history_dashboard(
+    fecha_desde: Optional[date_type] = None,
+    fecha_hasta: Optional[date_type] = None,
+    linea_id: Optional[int] = None,
+    categoria: Optional[str] = None,
+    estacion: Optional[str] = None,  # filtro por estación específica
+    top_n: int = Query(15, ge=1, le=100),
+    db: Session = Depends(get_db),
+):
+    """Métricas para mejora continua por estación."""
+    q = (
+        db.query(models.AlarmHistoryEvent, models.AlarmHistoryImport)
+        .join(models.AlarmHistoryImport,
+              models.AlarmHistoryEvent.import_id == models.AlarmHistoryImport.id)
+    )
+    if fecha_desde:
+        q = q.filter(models.AlarmHistoryImport.fecha >= fecha_desde)
+    if fecha_hasta:
+        q = q.filter(models.AlarmHistoryImport.fecha <= fecha_hasta)
+    if linea_id:
+        q = q.filter(models.AlarmHistoryImport.linea_id == linea_id)
+    if categoria and categoria in DTR_CATEGORIAS:
+        q = q.filter(models.AlarmHistoryEvent.categoria_dtr == categoria)
+    if estacion:
+        q = q.filter(models.AlarmHistoryEvent.estacion == estacion)
+
+    rows = q.all()
+    if not rows:
+        return {
+            "resumen": {"total_eventos": 0, "total_min": 0.0, "estaciones": 0,
+                        "total_imports": 0},
+            "top_estaciones_duracion": [],
+            "top_estaciones_frecuencia": [],
+            "por_categoria": [],
+            "distribucion_horaria": [],
+            "tendencia_diaria": [],
+            "detalle_estacion": None,
+        }
+
+    total_min = sum(e.adjusted_duration_min for e, _ in rows)
+    total_imports = len({i.id for _, i in rows})
+
+    # Acumulado por estación
+    est = {}
+    for e, _ in rows:
+        k = e.estacion or "(sin estación)"
+        if k not in est:
+            est[k] = {"estacion": k, "count": 0, "duracion_min": 0.0,
+                      "categorias": {}}
+        est[k]["count"] += 1
+        est[k]["duracion_min"] += e.adjusted_duration_min
+        cat = est[k]["categorias"]
+        cat[e.categoria_dtr] = cat.get(e.categoria_dtr, 0) + 1
+    lista_est = list(est.values())
+    for it in lista_est:
+        it["duracion_min"] = round(it["duracion_min"], 2)
+        # Categoría dominante (la que más eventos)
+        if it["categorias"]:
+            it["categoria_top"] = max(it["categorias"].items(),
+                                      key=lambda kv: kv[1])[0]
+        else:
+            it["categoria_top"] = "Otros"
+
+    top_dur = sorted(lista_est, key=lambda x: x["duracion_min"], reverse=True)[:top_n]
+    top_freq = sorted(lista_est, key=lambda x: x["count"], reverse=True)[:top_n]
+
+    # Por categoría
+    cat_acum = {c: {"count": 0, "duracion_min": 0.0} for c in DTR_CATEGORIAS}
+    for e, _ in rows:
+        b = cat_acum.get(e.categoria_dtr) or cat_acum["Otros"]
+        b["count"] += 1
+        b["duracion_min"] += e.adjusted_duration_min
+    por_categoria = [
+        {"categoria": c, "descripcion": DTR_CATEGORIAS_DESC[c],
+         "count": cat_acum[c]["count"],
+         "duracion_min": round(cat_acum[c]["duracion_min"], 2)}
+        for c in DTR_CATEGORIAS
+    ]
+
+    # Distribución horaria 0-23
+    hr = {h: {"hora": h, "count": 0, "duracion_min": 0.0} for h in range(24)}
+    for e, _ in rows:
+        b = hr[e.hora_dia]
+        b["count"] += 1
+        b["duracion_min"] += e.adjusted_duration_min
+    distribucion_horaria = [hr[h] for h in range(24)]
+    for d in distribucion_horaria:
+        d["duracion_min"] = round(d["duracion_min"], 2)
+
+    # Tendencia diaria
+    dia = {}
+    for e, i in rows:
+        k = i.fecha.isoformat()
+        if k not in dia:
+            dia[k] = {"fecha": k, "count": 0, "duracion_min": 0.0}
+        dia[k]["count"] += 1
+        dia[k]["duracion_min"] += e.adjusted_duration_min
+    tendencia = sorted(dia.values(), key=lambda x: x["fecha"])
+    for d in tendencia:
+        d["duracion_min"] = round(d["duracion_min"], 2)
+
+    # Detalle de estación si se filtró por una
+    detalle = None
+    if estacion:
+        msgs = {}
+        for e, _ in rows:
+            mk = (e.mensaje or "")[:200]
+            if mk not in msgs:
+                msgs[mk] = {"mensaje": mk, "categoria": e.categoria_dtr,
+                            "count": 0, "duracion_min": 0.0}
+            msgs[mk]["count"] += 1
+            msgs[mk]["duracion_min"] += e.adjusted_duration_min
+        top_msgs = sorted(msgs.values(), key=lambda x: x["duracion_min"],
+                          reverse=True)[:top_n]
+        for m in top_msgs:
+            m["duracion_min"] = round(m["duracion_min"], 2)
+        detalle = {"estacion": estacion, "top_mensajes": top_msgs}
+
+    return {
+        "resumen": {
+            "total_eventos": len(rows),
+            "total_min": round(total_min, 2),
+            "estaciones": len(est),
+            "total_imports": total_imports,
+        },
+        "top_estaciones_duracion": top_dur,
+        "top_estaciones_frecuencia": top_freq,
+        "por_categoria": por_categoria,
+        "distribucion_horaria": distribucion_horaria,
+        "tendencia_diaria": tendencia,
+        "detalle_estacion": detalle,
+    }
+
+
 # -------- Reporte gerencial --------
 def _check_gerente(password: str):
     # Acceso libre: validación eliminada por solicitud del usuario.
