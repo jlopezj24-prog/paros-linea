@@ -942,6 +942,230 @@ def kpis(fecha: date_type = Query(...), turno: str = Query(...), db: Session = D
     }
 
 
+# -------- Tendencias (análisis multi-día de paros capturados) --------
+@app.get("/api/tendencias")
+def tendencias(
+    fecha_desde: date_type = Query(...),
+    fecha_hasta: date_type = Query(...),
+    linea_id: Optional[int] = None,
+    area: Optional[str] = None,
+    turno: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Tendencia multi-día de los paros capturados por el operador.
+
+    Devuelve series y agregados pensados para gráficas de tendencia,
+    pareto, heatmap línea×día, sparklines, top descripciones y alerta
+    de empeoramiento 7d vs 7d previos.
+    """
+    if fecha_hasta < fecha_desde:
+        raise HTTPException(400, "fecha_hasta < fecha_desde")
+
+    q = (
+        db.query(models.RegistroHora)
+        .join(models.Linea, models.RegistroHora.linea_id == models.Linea.id)
+        .filter(models.RegistroHora.fecha >= fecha_desde,
+                models.RegistroHora.fecha <= fecha_hasta,
+                models.Linea.activa == True)  # noqa: E712
+    )
+    if linea_id:
+        q = q.filter(models.RegistroHora.linea_id == linea_id)
+    if area:
+        q = q.filter(models.Linea.area == area)
+    if turno in ("dia", "noche"):
+        q = q.filter(models.RegistroHora.turno == turno)
+    regs = q.all()
+
+    # Catálogo de líneas activas para garantizar que aparezcan aunque no
+    # tengan registros en el rango (útil para heatmap y sparklines)
+    lineas_q = db.query(models.Linea).filter_by(activa=True)
+    if linea_id:
+        lineas_q = lineas_q.filter(models.Linea.id == linea_id)
+    if area:
+        lineas_q = lineas_q.filter(models.Linea.area == area)
+    lineas = lineas_q.order_by(models.Linea.orden).all()
+
+    # Rango completo de fechas (para heatmap y sparklines con días sin captura)
+    from datetime import timedelta
+    fechas = []
+    d = fecha_desde
+    while d <= fecha_hasta:
+        fechas.append(d)
+        d += timedelta(days=1)
+
+    # --- Serie diaria por línea --------------------------------------
+    # clave (fecha_iso, linea_id) -> agregados
+    serie = {}
+    for l in lineas:
+        for f in fechas:
+            serie[(f.isoformat(), l.id)] = {
+                "fecha": f.isoformat(),
+                "linea_id": l.id,
+                "linea_nombre": l.nombre,
+                "area": l.area,
+                "min_paros": 0.0,
+                "eventos": 0,
+                "produccion": 0,
+                "meta": 0.0,
+            }
+    for r in regs:
+        k = (r.fecha.isoformat(), r.linea_id)
+        d = serie.get(k)
+        if not d:
+            continue
+        d["produccion"] += r.produccion
+        d["meta"] += _meta_de(r)
+        for p in r.paros:
+            d["min_paros"] += p.duracion_min
+            d["eventos"] += 1
+    serie_lista = []
+    for v in serie.values():
+        v["min_paros"] = round(v["min_paros"], 1)
+        v["meta"] = round(v["meta"], 1)
+        v["eficiencia_pct"] = (
+            round(v["produccion"] / v["meta"] * 100, 1) if v["meta"] else 0
+        )
+        serie_lista.append(v)
+    serie_lista.sort(key=lambda x: (x["fecha"], x["linea_nombre"]))
+
+    # --- Ranking por línea (todo el rango) ---------------------------
+    rank = {}
+    for l in lineas:
+        rank[l.id] = {
+            "linea_id": l.id, "linea_nombre": l.nombre, "area": l.area,
+            "min_paros": 0.0, "eventos": 0, "produccion": 0, "meta": 0.0,
+            "dias_con_captura": 0,
+        }
+    dias_por_linea = {l.id: set() for l in lineas}
+    for r in regs:
+        if r.linea_id not in rank:
+            continue
+        d = rank[r.linea_id]
+        d["produccion"] += r.produccion
+        d["meta"] += _meta_de(r)
+        dias_por_linea[r.linea_id].add(r.fecha)
+        for p in r.paros:
+            d["min_paros"] += p.duracion_min
+            d["eventos"] += 1
+    ranking = []
+    for lid, d in rank.items():
+        d["dias_con_captura"] = len(dias_por_linea[lid])
+        d["min_paros"] = round(d["min_paros"], 1)
+        d["meta"] = round(d["meta"], 1)
+        d["eficiencia_pct"] = (
+            round(d["produccion"] / d["meta"] * 100, 1) if d["meta"] else 0
+        )
+        d["promedio_min_dia"] = (
+            round(d["min_paros"] / d["dias_con_captura"], 1)
+            if d["dias_con_captura"] else 0
+        )
+        ranking.append(d)
+    ranking.sort(key=lambda x: x["min_paros"], reverse=True)
+
+    # --- Pareto por categoría con % acumulado -----------------------
+    cat = {}
+    for r in regs:
+        for p in r.paros:
+            k = p.categoria_id
+            d = cat.setdefault(k, {
+                "categoria_id": k, "categoria": p.categoria.nombre,
+                "color": p.categoria.color, "hex": p.categoria.hex,
+                "min_paros": 0.0, "eventos": 0,
+            })
+            d["min_paros"] += p.duracion_min
+            d["eventos"] += 1
+    cat_lista = sorted(cat.values(), key=lambda x: x["min_paros"], reverse=True)
+    total_cat = sum(c["min_paros"] for c in cat_lista) or 1.0
+    acum = 0.0
+    for c in cat_lista:
+        c["min_paros"] = round(c["min_paros"], 1)
+        c["pct"] = round(c["min_paros"] / total_cat * 100, 1)
+        acum += c["pct"]
+        c["pct_acumulado"] = round(acum, 1)
+
+    # --- Top descripciones recurrentes (texto normalizado) ----------
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip().lower())[:120]
+    desc = {}
+    for r in regs:
+        for p in r.paros:
+            txt = _norm(p.descripcion)
+            if not txt:
+                continue
+            d = desc.setdefault(txt, {
+                "descripcion": p.descripcion.strip()[:200],
+                "categoria": p.categoria.nombre,
+                "min_paros": 0.0, "eventos": 0,
+                "lineas": set(),
+            })
+            d["min_paros"] += p.duracion_min
+            d["eventos"] += 1
+            d["lineas"].add(r.linea.nombre)
+    top_desc = sorted(desc.values(), key=lambda x: x["min_paros"], reverse=True)[:15]
+    for d in top_desc:
+        d["min_paros"] = round(d["min_paros"], 1)
+        d["lineas"] = sorted(d["lineas"])[:5]
+
+    # --- Comparativo 7 días vs 7 anteriores ------------------------
+    from datetime import timedelta as _td
+    hoy_max = fecha_hasta
+    hace7 = hoy_max - _td(days=6)
+    hace14 = hoy_max - _td(days=13)
+    hace8 = hoy_max - _td(days=7)
+    actual = {l.id: 0.0 for l in lineas}
+    previo = {l.id: 0.0 for l in lineas}
+    for r in regs:
+        if r.linea_id not in actual:
+            continue
+        total_p = sum(p.duracion_min for p in r.paros)
+        if hace7 <= r.fecha <= hoy_max:
+            actual[r.linea_id] += total_p
+        elif hace14 <= r.fecha <= hace8:
+            previo[r.linea_id] += total_p
+    comparativo = []
+    for l in lineas:
+        a = round(actual[l.id], 1)
+        p = round(previo[l.id], 1)
+        if p > 0:
+            delta = round((a - p) / p * 100, 1)
+        elif a > 0:
+            delta = 100.0  # antes era 0, ahora hay paros
+        else:
+            delta = 0.0
+        comparativo.append({
+            "linea_id": l.id, "linea_nombre": l.nombre, "area": l.area,
+            "min_actual_7d": a, "min_anterior_7d": p, "delta_pct": delta,
+        })
+    comparativo.sort(key=lambda x: x["delta_pct"], reverse=True)
+
+    # --- Resumen global --------------------------------------------
+    total_min = sum(p.duracion_min for r in regs for p in r.paros)
+    total_eventos = sum(len(r.paros) for r in regs)
+    total_prod = sum(r.produccion for r in regs)
+    total_meta = sum(_meta_de(r) for r in regs)
+    dias_con_datos = len({r.fecha for r in regs})
+    resumen = {
+        "total_min_paros": round(total_min, 1),
+        "total_eventos": total_eventos,
+        "promedio_diario_min": round(total_min / dias_con_datos, 1) if dias_con_datos else 0,
+        "eficiencia_promedio_pct": round(total_prod / total_meta * 100, 1) if total_meta else 0,
+        "dias_con_datos": dias_con_datos,
+        "dias_rango": len(fechas),
+        "total_registros": len(regs),
+    }
+
+    return {
+        "resumen": resumen,
+        "serie_diaria_por_linea": serie_lista,
+        "ranking_lineas": ranking,
+        "pareto_categorias": cat_lista,
+        "top_descripciones": top_desc,
+        "comparativo_7_vs_7": comparativo,
+        "fechas": [f.isoformat() for f in fechas],
+        "lineas": [{"id": l.id, "nombre": l.nombre, "area": l.area} for l in lineas],
+    }
+
+
 # -------- Export Excel --------
 @app.get("/api/export/excel")
 def export_excel(fecha: date_type = Query(...), turno: str = Query(...),
