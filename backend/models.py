@@ -103,38 +103,3 @@ class DTRAlarma(Base):
     dtr_import = relationship("DTRImport", back_populates="alarmas")
 
 
-class AlarmHistoryImport(Base):
-    """Carga de un PDF Alarm History Report (eventos individuales con timestamp)."""
-    __tablename__ = "alarm_history_imports"
-    id = Column(Integer, primary_key=True, index=True)
-    fecha = Column(Date, nullable=False, index=True)
-    turno = Column(String(10), nullable=False, index=True)  # dia | noche
-    linea_id = Column(Integer, ForeignKey("lineas.id"), nullable=False, index=True)
-    sub_area = Column(String(40), default="")
-    archivo_nombre = Column(String(200), default="")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-    linea = relationship("Linea")
-    eventos = relationship("AlarmHistoryEvent", back_populates="ah_import",
-                           cascade="all, delete-orphan")
-
-
-class AlarmHistoryEvent(Base):
-    """Un evento individual: una estación que paró en un momento exacto."""
-    __tablename__ = "alarm_history_events"
-    id = Column(Integer, primary_key=True, index=True)
-    import_id = Column(Integer,
-                       ForeignKey("alarm_history_imports.id", ondelete="CASCADE"),
-                       nullable=False, index=True)
-    estacion = Column(String(80), default="", index=True)
-    mensaje = Column(Text, default="")
-    categoria_dtr = Column(String(10), nullable=False, index=True)
-    start_time = Column(DateTime, nullable=False, index=True)
-    end_time = Column(DateTime, nullable=True)
-    hora_dia = Column(Integer, nullable=False, index=True)  # 0-23 para heatmap
-    adjusted_duration_min = Column(Float, default=0.0)
-    raw_duration_min = Column(Float, default=0.0)
-
-    ah_import = relationship("AlarmHistoryImport", back_populates="eventos")
-
-
