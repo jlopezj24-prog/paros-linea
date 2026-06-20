@@ -50,9 +50,11 @@ import os
 GERENTE_PASS = os.environ.get("GERENTE_PASS", "gerente123")
 
 HORAS_TURNO = {
-    # (hora, label, minutos_productivos, tipo, meta_override_opcional)
+    # (hora, label, minutos_productivos, tipo, meta_override_opcional, jph_display_opcional)
     # tipo: "prod" = bloque productivo capturable; "break" = descanso, no capturable
     # Si meta_override está presente, sustituye al cálculo meta_jph * (minutos/60)
+    # Si jph_display está presente, ese es el JPH mostrado al usuario (útil cuando
+    # se quiere forzar JPH=76 pero meta de jobs=76 en bloque de 75 min, en vez de 95)
     "dia": [
         (1, "06:00-07:00", 60, "prod"),
         (2, "07:00-08:00", 60, "prod"),
@@ -65,7 +67,7 @@ HORAS_TURNO = {
         (8, "13:30-14:30", 60, "prod"),
         (9, "14:30-15:45  (incl. snack 15:00-15:15)", 60, "prod"),
         (10, "15:45-16:45", 60, "prod"),
-        (11, "16:45-18:00", 75, "prod", 95),
+        (11, "16:45-18:00", 75, "prod", 76, 76),
     ],
     "noche": [
         (1, "18:00-19:00", 60, "prod"),
@@ -79,7 +81,7 @@ HORAS_TURNO = {
         (8, "01:30-02:30", 60, "prod"),
         (9, "02:30-03:45  (incl. snack 03:00-03:15)", 60, "prod"),
         (10, "03:45-04:45", 60, "prod"),
-        (11, "04:45-06:00", 75, "prod", 95),
+        (11, "04:45-06:00", 75, "prod", 76, 76),
     ],
 }
 
@@ -218,8 +220,10 @@ def get_horas(turno: str):
     for item in HORAS_TURNO[turno]:
         h, l, m, t = item[0], item[1], item[2], item[3]
         override = item[4] if len(item) > 4 else None
+        jph_display = item[5] if len(item) > 5 else None
         out.append({"hora": h, "label": l, "minutos": m, "tipo": t,
-                    "meta_override": override})
+                    "meta_override": override,
+                    "jph_display": jph_display})
     return out
 
 
@@ -353,7 +357,7 @@ def _sugerir_linea(texto: str, lineas) -> Optional[int]:
         "TRIM3": "Vestiduras 3", "TRIM4": "Vestiduras 4",
         "CHASIS1": "Chasis 1", "CHASIS2": "Chasis 2", "CHASIS3": "Chasis 3",
         "FINAL": "Linea Final", "MOTORES": "Motores", "AGVS": "AGVS",
-        "PUERTAS": "Puertas", "TOLDOS": "Toldos",
+        "PUERTAS": "Puertas",
     }
     for token, nombre_linea in mapeo.items():
         if token in t:

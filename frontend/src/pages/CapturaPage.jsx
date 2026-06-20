@@ -74,10 +74,13 @@ export default function CapturaPage() {
         })),
       })
     } else {
-      // Bloques con override (último de 75 min) usan JPH 76; resto, 62
-      const jphDefault = h.meta_override != null
-        ? Math.round(h.meta_override * 60 / h.minutos)
-        : 62
+      // Si el bloque define jph_display, usar ese (fuerza JPH 76 en último bloque).
+      // Si no, derivar de meta_override o usar 62 por defecto.
+      const jphDefault = h.jph_display != null
+        ? h.jph_display
+        : (h.meta_override != null
+            ? Math.round(h.meta_override * 60 / h.minutos)
+            : 62)
       setMeta(jphDefault)
       setForm({ produccion: 0, observaciones: '', paros: [] })
     }
@@ -219,7 +222,9 @@ export default function CapturaPage() {
                   const metaH = h.meta_override != null
                     ? h.meta_override
                     : (r?.meta_jph || 62) * (h.minutos / 60)
-                  const jphH = Math.round(metaH * 60 / h.minutos)
+                  const jphH = h.jph_display != null
+                    ? h.jph_display
+                    : Math.round(metaH * 60 / h.minutos)
                   const ef = r ? (r.produccion / metaH * 100) : null
                   return (
                     <tr key={h.hora} className="border-b hover:bg-slate-50">
